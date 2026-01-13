@@ -164,21 +164,123 @@ def clustering(adata,
     return adata
 
 
+# def mclust_R(data, n_clusters, modelNames="EEE", random_seed=2023):
+
+#     np.random.seed(random_seed)
+#     import rpy2.robjects as robjects
+#     robjects.r.library("mclust")
+
+#     import rpy2.robjects.numpy2ri
+#     rpy2.robjects.numpy2ri.activate()
+#     r_random_seed = robjects.r['set.seed']
+#     r_random_seed(random_seed)
+#     rmclust = robjects.r['Mclust']
+#     res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(data), n_clusters, modelNames)
+#     mclust_res = np.array(res[-2])
+
+#     return mclust_res.astype(np.int32) - 1
 def mclust_R(data, n_clusters, modelNames="EEE", random_seed=2023):
+    """
+    Run mclust via external Rscript (no rpy2).
+    R and Python can be in different conda environments.
+    """
 
-    np.random.seed(random_seed)
-    import rpy2.robjects as robjects
-    robjects.r.library("mclust")
+    import numpy as np
+    import subprocess
+    import tempfile
+    import os
+    import textwrap
 
-    import rpy2.robjects.numpy2ri
-    rpy2.robjects.numpy2ri.activate()
-    r_random_seed = robjects.r['set.seed']
-    r_random_seed(random_seed)
-    rmclust = robjects.r['Mclust']
-    res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(data), n_clusters, modelNames)
-    mclust_res = np.array(res[-2])
+    data = np.asarray(data, dtype=float)
 
-    return mclust_res.astype(np.int32) - 1
+    # ---------- 1.临时文件 ----------
+    with tempfile.TemporaryDirectory() as tmpdir:
+        x_path = os.path.join(tmpdir, "X.csv")
+        y_path = os.path.join(tmpdir, "labels.txt")
+        r_path = os.path.join(tmpdir, "run_mclust.R")
+
+        # ---------- 2.写数据 ----------
+        np.savetxt(x_path, data, delimiter=",")
+
+        # ---------- 3.R 脚本 ----------
+        r_code = textwrap.dedent(f"""
+        suppressMessages(library(mclust))
+        
+        # 🔥 更强的seed固定
+        set.seed({random_seed}, kind="Mersenne-Twister", normal.kind="Inversion")
+        
+        # 🔥 关闭并行计算（如果有）
+        options(mc.cores = 1)
+        
+        X <- as.matrix(read.csv("{x_path}", header=FALSE))
+        dimnames(X) <- NULL
+        
+        # 🔥 显式指定初始化方法
+        res <- Mclust(
+            X, 
+            G={n_clusters}, 
+            modelNames="{modelNames}",
+            initialization=list(
+                subset=NULL,  # 不使用子集初始化
+                noise=NULL
+            )
+        )
+        
+        write.table(
+            res$classification - 1,
+            file="{y_path}",
+            row.names=FALSE,
+            col.names=FALSE
+            )
+        """)
+        # r_code = textwrap.dedent(f"""
+        # suppressMessages(library(mclust))
+        
+        # # 🔥 更强的seed固定
+        # set.seed({random_seed})
+        
+        # X <- as.matrix(read.csv("{x_path}", header=FALSE))
+        # dimnames(X) <- NULL
+        
+        # # 🔥 显式指定初始化方法
+        # res <- Mclust(
+        #     X, 
+        #     G={n_clusters}, 
+        #     modelNames="{modelNames}",
+        # )
+        
+        # write.table(
+        #     res$classification - 1,
+        #     file="{y_path}",
+        #     row.names=FALSE,
+        #     col.names=FALSE
+        #     )
+        # """)
+
+        with open(r_path, "w") as f:
+            f.write(r_code)
+
+        # ---------- 4.调用指定 Rscript ----------
+        rscript = "/home/pxy/miniconda3/envs/r40/bin/Rscript"
+
+        proc = subprocess.run(
+            [rscript, r_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "mclust failed\n"
+                "===== R STDOUT =====\n" + proc.stdout +
+                "\n===== R STDERR =====\n" + proc.stderr
+            )
+
+        # ---------- 5.读结果 ----------
+        labels = np.loadtxt(y_path, dtype=np.int32)
+
+    return labels
 
 
 def fix_seed(seed):
@@ -194,6 +296,49 @@ def fix_seed(seed):
     os.environ['PYTHONHASHSEED'] = str(seed)
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
+# def fix_seed(seed):
+#     """完全确定性的种子固定"""
+#     import os
+#     import random
+#     import numpy as np
+#     import torch
+#     from torch.backends import cudnn
+    
+#     # Python随机数
+#     random.seed(seed)
+#     os.environ['PYTHONHASHSEED'] = str(seed)
+    
+#     # Numpy随机数
+#     np.random.seed(seed)
+    
+#     # PyTorch随机数
+#     torch.manual_seed(seed)
+#     torch.cuda.manual_seed(seed)
+#     torch.cuda.manual_seed_all(seed)
+    
+#     # CuDNN设置
+#     cudnn.deterministic = True
+#     cudnn.benchmark = False
+    
+#     # PyTorch确定性算法（1.8+）
+#     try:
+#         torch.use_deterministic_algorithms(True)
+#     except: 
+#         print("⚠️  torch.use_deterministic_algorithms不可用，PyTorch版本可能过旧")
+    
+#     # CUDA环境变量
+#     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    
+#     # 禁用TF32（Ampere架构GPU）
+#     if hasattr(torch.backends.cuda, 'matmul'):
+#         torch.backends.cuda.matmul.allow_tf32 = False
+#     if hasattr(torch.backends.cudnn, 'allow_tf32'):
+#         torch.backends.cudnn.allow_tf32 = False
+    
+#     print(f"✅ 种子已固定为 {seed}")
+#     print(f"   - cudnn.deterministic = True")
+#     print(f"   - cudnn.benchmark = False")
+#     print(f"   - 确定性算法已启用")
 
 def searchRes(adata, fixed_clus_count, increment=0.01):
     '''
@@ -299,7 +444,7 @@ def nn_approx(ds1, ds2, names1, names2, knn=50, return_distance=False, metric="c
 
 ### - this function requires the [annoy] package; `from annoy import AnnoyIndex`
 def nn_annoy(ds1, ds2, names1, names2, knn=20, save=True, return_distance=False, metric="cosine", flag="in"):
-    """ Assumes that Y is zero-indexed. """
+    """ Assumes that Y is zero-indexed."""
     # Build index.
     if (metric == "cosine"):
         tree = AnnoyIndex(ds2.shape[1], metric="angular")  #metric
