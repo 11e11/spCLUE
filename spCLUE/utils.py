@@ -164,22 +164,54 @@ def clustering(adata,
     return adata
 
 
-def mclust_R(data, n_clusters, modelNames="EEE", random_seed=2023):
+# def mclust_R(data, n_clusters, modelNames="EEE", random_seed=2023):
 
+#     np.random.seed(random_seed)
+#     import rpy2.robjects as robjects
+#     robjects.r.library("mclust")
+
+#     import rpy2.robjects.numpy2ri
+#     rpy2.robjects.numpy2ri.activate()
+#     r_random_seed = robjects.r['set.seed']
+#     r_random_seed(random_seed)
+#     rmclust = robjects.r['Mclust']
+#     res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(data), n_clusters, modelNames)
+#     mclust_res = np.array(res[-2])
+
+#     return mclust_res.astype(np.int32) - 1
+def mclust_R(data, n_clusters, modelNames="EEE", random_seed=2023):
     np.random.seed(random_seed)
     import rpy2.robjects as robjects
+    
+    # 1. 加载库
     robjects.r.library("mclust")
-
-    import rpy2.robjects.numpy2ri
-    rpy2.robjects.numpy2ri.activate()
+    
+    # 2. 设置随机数
     r_random_seed = robjects.r['set.seed']
     r_random_seed(random_seed)
+    
+    # 3. 获取函数
     rmclust = robjects.r['Mclust']
-    res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(data), n_clusters, modelNames)
+    as_dataframe = robjects.r['as.data.frame'] # <--- 新增：获取转换函数
+    
+    # 4. 手动构建矩阵
+    nr, nc = data.shape
+    r_vec = robjects.FloatVector(data.ravel())
+    r_mat = robjects.r.matrix(r_vec, nrow=nr, ncol=nc, byrow=True)
+    
+    # 5. 【核心修复】将矩阵转换为 Data Frame
+    # 这一步会自动给数据加上列名 (V1, V2...)，彻底解决 dimnames 报错
+    r_df = as_dataframe(r_mat)
+    
+    # 6. 准备参数
+    n_clusters_int = int(n_clusters)
+    
+    # 7. 调用 Mclust (传入 r_df 而不是 r_mat)
+    res = rmclust(data=r_df, G=n_clusters_int, modelNames=modelNames)
+    
+    # 8. 提取结果
     mclust_res = np.array(res[-2])
-
     return mclust_res.astype(np.int32) - 1
-
 
 def fix_seed(seed):
     os.environ['PYTHONHASHSEED'] = str(seed)
