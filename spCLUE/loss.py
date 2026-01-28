@@ -329,87 +329,188 @@ class ClusterLoss(nn.Module):
 
         return loss, 1.* neg_entropy_loss
     
+# class LocalAggregationContrastiveLoss(nn.Module):
+#     """
+#     局部聚合级对比学习损失
+    
+#     拉近两个视图中同一Spot的AvgReadout（邻居平均）
+#     推远随机选择的Spot的AvgReadout
+#     """
+#     def __init__(self, temperature=0.2, n_negative_samples=256):
+#         super(LocalAggregationContrastiveLoss, self).__init__()
+#         self.temperature = temperature
+#         self.n_negative_samples = n_negative_samples
+    
+#     def compute_avg_readout(self, z, adj):
+#         """
+#         计算每个spot的局部聚合嵌入（邻居平均）
+        
+#         Args:
+#             z: [n_spots × embed_dim] 嵌入
+#             adj: [n_spots × n_spots] 邻接矩阵（稀疏）
+        
+#         Returns:
+#             avg_z: [n_spots × embed_dim] 平均聚合嵌入
+#         """
+#         # 计算度矩阵
+#         degrees = torch.sparse.sum(adj, dim=1).to_dense()  # [n_spots]
+#         degrees = degrees.unsqueeze(1)  # [n_spots × 1]
+        
+#         # 聚合邻居
+#         neighbor_sum = torch.spmm(adj, z)  # [n_spots × embed_dim]
+        
+#         # 平均（避免除以0）
+#         avg_z = neighbor_sum / (degrees + 1e-8)
+        
+#         return avg_z
+    
+#     def forward(self, z1, z2, adj1, adj2):
+#         """
+#         Args:
+#             z1: [n_spots × embed_dim] 空间视图嵌入
+#             z2: [n_spots × embed_dim] 表达视图嵌入
+#             adj1: 空间图邻接矩阵
+#             adj2: 表达图邻接矩阵
+        
+#         Returns:
+#             loss: 标量
+#         """
+#         n_spots = z1.size(0)
+        
+#         # 🔥 计算局部聚合嵌入（AvgReadout）
+#         avg_z1 = self.compute_avg_readout(z1, adj1)  # [n_spots × embed_dim]
+#         avg_z2 = self.compute_avg_readout(z2, adj2)
+        
+#         # L2归一化
+#         avg_z1 = F.normalize(avg_z1, p=2, dim=1)
+#         avg_z2 = F.normalize(avg_z2, p=2, dim=1)
+        
+#         # 🔥 对比学习：同一spot的avg_z1和avg_z2为正样本
+#         # 计算正样本相似度
+#         pos_sim = (avg_z1 * avg_z2).sum(dim=1) / self.temperature  # [n_spots]
+        
+#         # 🔥 采样负样本：随机选择其他spot的avg_z2
+#         if self.n_negative_samples >= n_spots:
+#             # 使用所有spot作为负样本
+#             neg_sim = torch.mm(avg_z1, avg_z2.t()) / self.temperature  # [n_spots × n_spots]
+#         else:
+#             # 随机采样负样本
+#             neg_indices = torch.randint(0, n_spots, (n_spots, self.n_negative_samples), device=z1.device)
+#             neg_z2 = avg_z2[neg_indices]  # [n_spots × n_negative_samples × embed_dim]
+#             neg_sim = (avg_z1.unsqueeze(1) * neg_z2).sum(dim=2) / self.temperature  # [n_spots × n_negative_samples]
+        
+#         # InfoNCE损失
+#         pos_exp = torch.exp(pos_sim)  # [n_spots]
+        
+#         if self.n_negative_samples >= n_spots:
+#             neg_exp_sum = torch.exp(neg_sim).sum(dim=1)  # [n_spots]
+#         else:
+#             neg_exp_sum = torch.exp(neg_sim).sum(dim=1)  # [n_spots]
+        
+#         loss = -torch.log(pos_exp / (pos_exp + neg_exp_sum + 1e-8)).mean()
+        
+#         return loss
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class LocalAggregationContrastiveLoss(nn.Module):
     """
-    局部聚合级对比学习损失
+    修正后的局部聚合对比损失 (SpaBatch 风格)
     
-    拉近两个视图中同一Spot的AvgReadout（邻居平均）
-    推远随机选择的Spot的AvgReadout
+    - 正样本: 中心点 vs 真实邻居聚合 (Center <-> Neighbor Readout)
+    - 负样本: 中心点 vs 随机聚合的伪向量 (Center <-> Fake Readout)
+      (Fake Readout 由随机选择的 'num_mix' 个样本平均而成)
     """
-    def __init__(self, temperature=0.2, n_negative_samples=256):
+    def __init__(self, num_mix=10, temperature=1.0):
+        """
+        Args:
+            num_mix: 负样本聚合的采样数量 (a)
+            temperature: 相似度缩放系数
+        """
         super(LocalAggregationContrastiveLoss, self).__init__()
+        self.num_mix = num_mix
         self.temperature = temperature
-        self.n_negative_samples = n_negative_samples
+        # 使用 BCE Loss (Deep Graph Infomax 标准做法)
+        # 标签1为正样本(真实邻居)，标签0为负样本(伪邻居)
+        self.bce_loss = nn.BCEWithLogitsLoss()
     
     def compute_avg_readout(self, z, adj):
+        """计算真实邻居聚合"""
+        degrees = torch.sparse.sum(adj, dim=1).to_dense().unsqueeze(1)
+        neighbor_sum = torch.spmm(adj, z)
+        return neighbor_sum / (degrees + 1e-8)
+
+    def generate_fake_readout(self, z):
         """
-        计算每个spot的局部聚合嵌入（邻居平均）
-        
-        Args:
-            z: [n_spots × embed_dim] 嵌入
-            adj: [n_spots × n_spots] 邻接矩阵（稀疏）
-        
-        Returns:
-            avg_z: [n_spots × embed_dim] 平均聚合嵌入
+        生成负样本：随机选择 num_mix 个点，计算其均值作为伪读出向量
+        返回: [1, dim] 的全局伪向量
         """
-        # 计算度矩阵
-        degrees = torch.sparse.sum(adj, dim=1).to_dense()  # [n_spots]
-        degrees = degrees.unsqueeze(1)  # [n_spots × 1]
-        
-        # 聚合邻居
-        neighbor_sum = torch.spmm(adj, z)  # [n_spots × embed_dim]
-        
-        # 平均（避免除以0）
-        avg_z = neighbor_sum / (degrees + 1e-8)
-        
-        return avg_z
+        n_spots = z.size(0)
+        # 随机采样索引
+        rand_indices = torch.randperm(n_spots, device=z.device)[:self.num_mix]
+        # 获取采样点并求平均
+        sampled_z = z[rand_indices] # [num_mix, dim]
+        fake_vec = sampled_z.mean(dim=0, keepdim=True) # [1, dim]
+        return fake_vec
     
+    def contrastive_loss(self, z_center, z_context_pos, z_context_neg):
+        """
+        计算单向对比损失 (Center -> Context)
+        """
+        batch_size = z_center.size(0)
+        
+        # 1. 计算正样本相似度 (Center . Neighbor) -> [N, 1]
+        pos_sim = (z_center * z_context_pos).sum(dim=1, keepdim=True) / self.temperature
+        
+        # 2. 计算负样本相似度 (Center . Fake) -> [N, 1]
+        # z_context_neg 是 [1, dim]，会自动广播到 [N, dim]
+        neg_sim = (z_center * z_context_neg).sum(dim=1, keepdim=True) / self.temperature
+        
+        # 3. 拼接 logits 和 labels
+        # 我们希望 pos_sim -> 1, neg_sim -> 0
+        logits = torch.cat([pos_sim, neg_sim], dim=0) # [2N, 1]
+        
+        labels_pos = torch.ones_like(pos_sim)
+        labels_neg = torch.zeros_like(neg_sim)
+        labels = torch.cat([labels_pos, labels_neg], dim=0) # [2N, 1]
+        
+        # 4. 计算 BCE Loss
+        loss = self.bce_loss(logits, labels)
+        return loss
+
     def forward(self, z1, z2, adj1, adj2):
         """
-        Args:
-            z1: [n_spots × embed_dim] 空间视图嵌入
-            z2: [n_spots × embed_dim] 表达视图嵌入
-            adj1: 空间图邻接矩阵
-            adj2: 表达图邻接矩阵
-        
-        Returns:
-            loss: 标量
+        z1: 空间视图嵌入
+        z2: 表达视图嵌入
         """
-        n_spots = z1.size(0)
+        # --- 准备工作 ---
+        # 归一化 (保证余弦相似度)
+        z1 = F.normalize(z1, p=2, dim=1)
+        z2 = F.normalize(z2, p=2, dim=1)
         
-        # 🔥 计算局部聚合嵌入（AvgReadout）
-        avg_z1 = self.compute_avg_readout(z1, adj1)  # [n_spots × embed_dim]
-        avg_z2 = self.compute_avg_readout(z2, adj2)
-        
-        # L2归一化
+        # 计算真实邻域 (Positive Context)
+        avg_z1 = self.compute_avg_readout(z1, adj1) # 空间邻域
+        avg_z2 = self.compute_avg_readout(z2, adj2) # 表达邻域
         avg_z1 = F.normalize(avg_z1, p=2, dim=1)
         avg_z2 = F.normalize(avg_z2, p=2, dim=1)
         
-        # 🔥 对比学习：同一spot的avg_z1和avg_z2为正样本
-        # 计算正样本相似度
-        pos_sim = (avg_z1 * avg_z2).sum(dim=1) / self.temperature  # [n_spots]
+        # 生成伪邻域 (Negative Context)
+        # 负样本：随机混合的向量
+        fake_z1 = self.generate_fake_readout(z1) # 来自空间的伪向量
+        fake_z2 = self.generate_fake_readout(z2) # 来自表达的伪向量
+        fake_z1 = F.normalize(fake_z1, p=2, dim=1)
+        fake_z2 = F.normalize(fake_z2, p=2, dim=1)
         
-        # 🔥 采样负样本：随机选择其他spot的avg_z2
-        if self.n_negative_samples >= n_spots:
-            # 使用所有spot作为负样本
-            neg_sim = torch.mm(avg_z1, avg_z2.t()) / self.temperature  # [n_spots × n_spots]
-        else:
-            # 随机采样负样本
-            neg_indices = torch.randint(0, n_spots, (n_spots, self.n_negative_samples), device=z1.device)
-            neg_z2 = avg_z2[neg_indices]  # [n_spots × n_negative_samples × embed_dim]
-            neg_sim = (avg_z1.unsqueeze(1) * neg_z2).sum(dim=2) / self.temperature  # [n_spots × n_negative_samples]
+        # --- 交叉对比 (Cross-View) ---
+        # 任务 A: 空间中心 (z1) 区分 表达真实邻域 (avg_z2) 和 表达伪向量 (fake_z2)
+        loss_a = self.contrastive_loss(z1, avg_z2, fake_z2)
         
-        # InfoNCE损失
-        pos_exp = torch.exp(pos_sim)  # [n_spots]
+        # 任务 B: 表达中心 (z2) 区分 空间真实邻域 (avg_z1) 和 空间伪向量 (fake_z1)
+        loss_b = self.contrastive_loss(z2, avg_z1, fake_z1)
         
-        if self.n_negative_samples >= n_spots:
-            neg_exp_sum = torch.exp(neg_sim).sum(dim=1)  # [n_spots]
-        else:
-            neg_exp_sum = torch.exp(neg_sim).sum(dim=1)  # [n_spots]
-        
-        loss = -torch.log(pos_exp / (pos_exp + neg_exp_sum + 1e-8)).mean()
-        
-        return loss
+        return (loss_a + loss_b) / 2
+
     
 # ==================== 🔥 新增：原型对比学习损失 ====================
 from fast_pytorch_kmeans import KMeans

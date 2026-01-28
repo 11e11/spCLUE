@@ -382,8 +382,8 @@ def preprocess(adata, n_top_genes=2000):
     print("="*70)
     
     # # 1. 基础过滤
-    sc.pp.filter_genes(adata, min_cells=1)
-    sc.pp.filter_genes(adata, min_counts=1)
+    sc.pp.filter_genes(adata, min_cells=50)
+    sc.pp.filter_genes(adata, min_counts=10)
     
     # 2. 备份原始计数 (为了 seurat_v3 能够正确运行)
     if issparse(adata.X):

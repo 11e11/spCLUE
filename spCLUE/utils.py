@@ -180,107 +180,38 @@ def clustering(adata,
 
 #     return mclust_res.astype(np.int32) - 1
 def mclust_R(data, n_clusters, modelNames="EEE", random_seed=2023):
-    """
-    Run mclust via external Rscript (no rpy2).
-    R and Python can be in different conda environments.
-    """
-
-    import numpy as np
-    import subprocess
-    import tempfile
-    import os
-    import textwrap
-
-    data = np.asarray(data, dtype=float)
-
-    # ---------- 1.临时文件 ----------
-    with tempfile.TemporaryDirectory() as tmpdir:
-        x_path = os.path.join(tmpdir, "X.csv")
-        y_path = os.path.join(tmpdir, "labels.txt")
-        r_path = os.path.join(tmpdir, "run_mclust.R")
-
-        # ---------- 2.写数据 ----------
-        np.savetxt(x_path, data, delimiter=",")
-
-        # ---------- 3.R 脚本 ----------
-        r_code = textwrap.dedent(f"""
-        suppressMessages(library(mclust))
-        
-        # 🔥 更强的seed固定
-        set.seed({random_seed}, kind="Mersenne-Twister", normal.kind="Inversion")
-        
-        # 🔥 关闭并行计算（如果有）
-        options(mc.cores = 1)
-        
-        X <- as.matrix(read.csv("{x_path}", header=FALSE))
-        dimnames(X) <- NULL
-        
-        # 🔥 显式指定初始化方法
-        res <- Mclust(
-            X, 
-            G={n_clusters}, 
-            modelNames="{modelNames}",
-            initialization=list(
-                subset=NULL,  # 不使用子集初始化
-                noise=NULL
-            )
-        )
-        
-        write.table(
-            res$classification - 1,
-            file="{y_path}",
-            row.names=FALSE,
-            col.names=FALSE
-            )
-        """)
-        # r_code = textwrap.dedent(f"""
-        # suppressMessages(library(mclust))
-        
-        # # 🔥 更强的seed固定
-        # set.seed({random_seed})
-        
-        # X <- as.matrix(read.csv("{x_path}", header=FALSE))
-        # dimnames(X) <- NULL
-        
-        # # 🔥 显式指定初始化方法
-        # res <- Mclust(
-        #     X, 
-        #     G={n_clusters}, 
-        #     modelNames="{modelNames}",
-        # )
-        
-        # write.table(
-        #     res$classification - 1,
-        #     file="{y_path}",
-        #     row.names=FALSE,
-        #     col.names=FALSE
-        #     )
-        # """)
-
-        with open(r_path, "w") as f:
-            f.write(r_code)
-
-        # ---------- 4.调用指定 Rscript ----------
-        rscript = "/home/pxy/miniconda3/envs/r40/bin/Rscript"
-
-        proc = subprocess.run(
-            [rscript, r_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        if proc.returncode != 0:
-            raise RuntimeError(
-                "mclust failed\n"
-                "===== R STDOUT =====\n" + proc.stdout +
-                "\n===== R STDERR =====\n" + proc.stderr
-            )
-
-        # ---------- 5.读结果 ----------
-        labels = np.loadtxt(y_path, dtype=np.int32)
-
-    return labels
+    np.random.seed(random_seed)
+    import rpy2.robjects as robjects
+    
+    # 1. 加载库
+    robjects.r.library("mclust")
+    
+    # 2. 设置随机数
+    r_random_seed = robjects.r['set.seed']
+    r_random_seed(random_seed)
+    
+    # 3. 获取函数
+    rmclust = robjects.r['Mclust']
+    as_dataframe = robjects.r['as.data.frame'] # <--- 新增：获取转换函数
+    
+    # 4. 手动构建矩阵
+    nr, nc = data.shape
+    r_vec = robjects.FloatVector(data.ravel())
+    r_mat = robjects.r.matrix(r_vec, nrow=nr, ncol=nc, byrow=True)
+    
+    # 5. 【核心修复】将矩阵转换为 Data Frame
+    # 这一步会自动给数据加上列名 (V1, V2...)，彻底解决 dimnames 报错
+    r_df = as_dataframe(r_mat)
+    
+    # 6. 准备参数
+    n_clusters_int = int(n_clusters)
+    
+    # 7. 调用 Mclust (传入 r_df 而不是 r_mat)
+    res = rmclust(data=r_df, G=n_clusters_int, modelNames=modelNames)
+    
+    # 8. 提取结果
+    mclust_res = np.array(res[-2])
+    return mclust_res.astype(np.int32) - 1
 
 
 def fix_seed(seed):

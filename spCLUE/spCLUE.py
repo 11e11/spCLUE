@@ -284,6 +284,7 @@ from .loss import (
     PrototypeContrastiveLoss,
     ReconstructionLoss,  # 🔥 统一的重构损失接口
     SCELoss,
+    MSELoss,
     CentroidAlignmentLoss,  # 🔥 质心对齐
     SoftClusterAlignmentLoss  # 🔥 软聚类对齐
 )
@@ -309,7 +310,7 @@ class spCLUE:
         dim_input=200,
         dim_hidden=64,
         dim_embed=24,
-        graph_corr=0.4,
+        graph_corr=0.2,
         node_corr=0.2,  # 节点遮蔽概率
         dropout=0.5,
         gamma=1,
@@ -400,7 +401,7 @@ class spCLUE:
             self.model = CCGCN(
                 self.dims_list, 
                 self.n_clusters, 
-                self.n_hvgs,  # 🔥 传入HVG数量
+                
                 self.graph_corr, 
                 self.node_corr,
                 dropout
@@ -481,13 +482,13 @@ class spCLUE:
         
         # 🔥 新增：局部聚合级对比学习损失
         self.local_agg_crit = LocalAggregationContrastiveLoss(
-            temperature=0.2,
-            n_negative_samples=1  # 负样本数量
+            # temperature=0.2,
+            # n_negative_samples=1  # 负样本数量
         ).to(self.device)
 
         self.rec_crit = ReconstructionLoss(loss_type=self.reconstruction_loss)
         self.rec_crit = self.rec_crit.to(self.device)
-        self.sce_crit = SCELoss(alpha=0.1, beta=1.0).to(self.device)
+        self.rec_crit2 = MSELoss().to(self.device)
 
         self.optimizer = torch.optim.Adam(
             filter(lambda p: p.requires_grad, self.model.parameters()),
@@ -536,7 +537,7 @@ class spCLUE:
             ) / 2
             cur_contrastive_loss = 0
             if mask_nodes.sum() > 0:
-                cur_mask_rec_loss = self.sce_crit(
+                cur_mask_rec_loss = self.rec_crit2(
                     x_rec[mask_nodes], self.hvg_data[mask_nodes])
             else:
                 cur_mask_rec_loss = torch.tensor(0.0,device=self.device)
@@ -554,23 +555,23 @@ class spCLUE:
             cur_rec_expr_loss = self.rec_crit(x_rec, self.hvg_data)
             
             # 🔥 Local aggregation contrastive loss
-            # cur_local_agg_loss = self.local_agg_crit(
-            #     output_spa,  # 空间视图嵌入
-            #     output_expr,  # 表达视图嵌入
-            #     self.g_spatial,  # 空间图
-            #     self.g_expr  # 表达图
-            # )
+            cur_local_agg_loss = self.local_agg_crit(
+                output_spa,  # 空间视图嵌入
+                output_expr,  # 表达视图嵌入
+                self.g_spatial,  # 空间图
+                self.g_expr  # 表达图
+            )
 
             cur_loss, neg_loss = self.cluster_crit2(predlabel1, predlabel2)
             cur_cluster_loss = cur_loss + 1. *neg_loss
 
             cur_batch_loss = (
-                self.kappa * cur_contrastive_loss
+                # self.kappa * cur_contrastive_loss
                 # + self.beta * cluster_weight * cur_cluster_loss  # 🔥 应用warmup权重
-                + self.beta * cur_cluster_loss  
+                self.beta * cur_cluster_loss  
                 + self.gamma * cur_rec_expr_loss
-                # + self.gamma_mask * cur_mask_rec_loss
-                # + 5.0 * cur_local_agg_loss  
+                + self.gamma_mask * cur_mask_rec_loss
+                + 10.0 * cur_local_agg_loss  
             )
             
             cur_batch_loss.backward()
