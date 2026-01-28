@@ -547,9 +547,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class CCGCN(nn.Module):
     """
-    单切片模型 (修正版: SEDR 风格编码器 + SEDR 风格单层 GCN 解码器)
+    单切片模型 (加入 GraphMAE 风格的 Remask 机制)
     """
     def __init__(self, dims_list, n_clusters, graph_corr=0.2, dropout=0.5, node_corr=0.2) -> None:
         super(CCGCN, self).__init__()
@@ -557,9 +561,9 @@ class CCGCN(nn.Module):
         # dims_list: [200, 64, 16]
         self.input_dim = dims_list[0]   # 200
         self.hidden_dim = dims_list[1]  # 64
-        self.enc_z_dim = dims_list[2]   # 16 (单分支维度)
+        self.enc_z_dim = dims_list[2]   # 16
         
-        # 🔥 最终嵌入维度 = MLP分支(16) + GCN分支(16) = 32
+        # 最终嵌入维度 = 32
         self.z_dim = self.enc_z_dim * 2 
         
         self.dropout = dropout
@@ -567,31 +571,32 @@ class CCGCN(nn.Module):
         self.graph_corr = graph_corr
         self.node_corr = node_corr
 
-        # === 1. 编码器层 (SEDR 风格: MLP + GCN 并行) ===
-        # MLP 分支
-        self.MLP1 = nn.Linear(self.input_dim, self.hidden_dim)      # 200 -> 64
-        self.MLP2 = nn.Linear(self.hidden_dim, self.enc_z_dim)      # 64 -> 16
+        # === 1. 编码器层 ===
+        self.MLP1 = nn.Linear(self.input_dim, self.hidden_dim)
+        self.MLP2 = nn.Linear(self.hidden_dim, self.enc_z_dim)
         
-        # GCN 分支
-        self.GCN1 = nn.Linear(self.enc_z_dim, self.hidden_dim)      # 16 -> 64
-        self.GCN2 = nn.Linear(self.hidden_dim, self.enc_z_dim)      # 64 -> 16
+        self.GCN1 = nn.Linear(self.enc_z_dim, self.hidden_dim)
+        self.GCN2 = nn.Linear(self.hidden_dim, self.enc_z_dim)
         
-        # === 2. 解码器层 (SEDR 风格: 单层 GCN) ===
-        # 🔥 修正点：直接从 z_dim (32) 映射回 input_dim (200)
-        # 这就是 GCN 公式 Z*W 中的 W
+        # === 2. 解码器层 ===
         self.decoder = nn.Linear(self.z_dim, self.input_dim) 
 
         # === 其他组件 ===
         self.noiseLayer = NoiseLayer(dropout=self.dropout)
         self.act = nn.ELU()
         self.relu = nn.ReLU()
-        self.attention = AttentionBlock(self.z_dim) # 输入是 32
+        self.attention = AttentionBlock(self.z_dim)
         
-        # Mask token
+        # Input Mask token (用于输入层的掩码，维度 200)
         self.mask_token = nn.Parameter(torch.zeros(1, self.input_dim))
         nn.init.normal_(self.mask_token, std=0.02)
 
-        # Instance Projection Head (32 -> 32)
+        # 🔥 [新增] Decoder Mask Token (用于中间层的 Remask，维度 32)
+        # GraphMAE 的核心：在进入解码器前，再次掩盖潜在表示
+        self.dec_mask_token = nn.Parameter(torch.zeros(1, self.z_dim))
+        nn.init.xavier_normal_(self.dec_mask_token)
+
+        # Instance Projection Head
         self.projectInsHead = nn.Sequential(
             nn.Linear(self.z_dim, self.z_dim),
             nn.ReLU(),
@@ -599,7 +604,7 @@ class CCGCN(nn.Module):
             nn.ReLU(),
         )
 
-        # Cluster Projection Head (32 -> n_clusters)
+        # Cluster Projection Head
         self.projectClsHead = nn.Sequential(
             nn.Linear(self.z_dim, self.z_dim),
             nn.ReLU(),
@@ -611,7 +616,6 @@ class CCGCN(nn.Module):
         labels = self.projectClsHead(embed)
         return torch.argmax(labels, dim=1)
     
-    # ... mask_features 和 dropout_edge 函数保持不变 ...
     def mask_features(self, x, mask_rate):
         n_spots = x.size(0)
         if not self.training or mask_rate == 0:
@@ -635,46 +639,38 @@ class CCGCN(nn.Module):
         return remaining_adj
 
     def encoder(self, data, adj):
-        """
-        SEDR 风格双流编码器
-        Input: [N, 200]
-        Output: [N, 32] (MLP_16 + GCN_16)
-        """
-        # --- MLP 流 ---
+        # MLP 流
         h_mlp = self.noiseLayer(data)
-        h_mlp = self.act(self.MLP1(h_mlp)) # 200 -> 64
+        h_mlp = self.act(self.MLP1(h_mlp))
         h_mlp = F.dropout(h_mlp, p=self.dropout, training=self.training)
-        z_mlp = self.act(self.MLP2(h_mlp)) # 64 -> 16
+        z_mlp = self.act(self.MLP2(h_mlp))
         
-        # --- GCN 流 ---
-        # 输入是 MLP 的输出
-        h_gcn = self.GCN1(z_mlp)           # 16 -> 64
-        h_gcn = torch.spmm(adj, h_gcn)     # SpMM
+        # GCN 流
+        h_gcn = self.GCN1(z_mlp)
+        h_gcn = torch.spmm(adj, h_gcn)
         h_gcn = self.act(h_gcn)
         h_gcn = F.dropout(h_gcn, p=self.dropout, training=self.training)
         
-        h_gcn = self.GCN2(h_gcn)           # 64 -> 16
-        z_gcn = torch.spmm(adj, h_gcn)     # SpMM
+        h_gcn = self.GCN2(h_gcn)
+        z_gcn = torch.spmm(adj, h_gcn)
         
-        # --- 拼接 ---
-        feature = torch.cat([z_mlp, z_gcn], dim=1) # [N, 32]
+        feature = torch.cat([z_mlp, z_gcn], dim=1)
         return feature
 
     def forward(self, data, adj_spatial, adj_expr, rec_activation='none'):
-        """
-        Args:
-            data: 原始 PCA 特征 [N, 200]
-            adj_spatial: 原始空间邻接矩阵 (Ground Truth)
-            adj_expr: 原始表达邻接矩阵
-        """
         # 1. 数据增强
-        adj_spatial_dropped = self.dropout_edge(adj_spatial, self.graph_corr)
-        data_masked, mask_nodes = self.mask_features(data, self.node_corr)
+        # adj_spatial_dropped = self.dropout_edge(adj_spatial, self.graph_corr)
+        # # 获取 mask_nodes (True 表示该节点被 Mask 了)
+        # data_masked, mask_nodes = self.mask_features(data, self.node_corr)
+        adj_view1 = self.dropout_edge(adj_spatial, self.graph_corr)
+        x_view1 = data
+
+        adj_view2 = adj_spatial
+        x_view2, mask_nodes = self.mask_features(data, self.node_corr)
         
         # 2. 编码
-        feature_spatial = self.encoder(data, adj_spatial_dropped) # [N, 32]
-        feature_expr = self.encoder(data_masked, adj_expr)        # [N, 32]
-
+        feature_spatial = self.encoder(x_view1, adj_view1) 
+        feature_expr = self.encoder(x_view2, adj_view2)       
         # 3. 归一化 & 聚类
         z_spatial_norm = F.normalize(feature_spatial, p=2, dim=1)
         z_expr_norm = F.normalize(feature_expr, p=2, dim=1)
@@ -690,15 +686,23 @@ class CCGCN(nn.Module):
         output1 = feature_spatial
         output2 = feature_expr
 
-        # === 🔥 6. 重构 (SEDR 逻辑: 单层 GCN) ===
-        # 公式: X_rec = A * (Z * W)
-        # 输入: z_fuse (融合后的 32 维嵌入)
-        # 邻接矩阵: adj_spatial (原始空间图，用于平滑修复)
+        # === 🔥 6. 重构 (加入 Remask 逻辑) ===
+        
+        # [关键步骤]: Remask
+        # 即使 z_fuse 此时可能包含了通过 feature_spatial 泄露的原始信息，
+        # 我们在这里强制把 mask_nodes 对应的嵌入替换成 mask_token。
+        h_decoder_input = z_fuse.clone()
+        
+        # 只有在训练时才进行 Remask
+        if self.training and mask_nodes.sum() > 0:
+            h_decoder_input[mask_nodes] = self.dec_mask_token
         
         # Step A: 线性变换 (Embedding 32 -> Feature 200)
-        rec_h = self.decoder(z_fuse) 
+        # 此时，被 Mask 的位置是纯粹的 dec_mask_token
+        rec_h = self.decoder(h_decoder_input) 
         
         # Step B: 图聚合 (利用空间邻居信息)
+        # 解码器被迫使用 adj_spatial 中的邻居信息来填补 dec_mask_token 造成的空缺
         x_rec = torch.spmm(adj_spatial, rec_h)
         
         # 激活函数
@@ -716,7 +720,7 @@ class CCGCN(nn.Module):
             predlabel_spatial,
             predlabel_expr,
             x_rec,
-            mask_nodes
+            mask_nodes # 返回 mask 索引供 Loss 使用
         )
 # class CCGCN(Module):
 #     """单切片模型"""
