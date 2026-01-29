@@ -395,6 +395,7 @@ def preprocess(adata, n_top_genes=2000):
     sc.pp.highly_variable_genes(
         adata, 
         n_top_genes=n_top_genes, 
+        layer='count',
         subset=False,
         flavor='seurat_v3',
     )
@@ -467,7 +468,7 @@ def prepare_graph(adata, graph_type="spatial", n_neighbors=10):
         print(f"  - 使用空间坐标: {coords.shape}")
         
         # 构建KNN图
-        nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm='ball_tree').fit(coords)
+        nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(coords)
         distances, indices = nbrs.kneighbors(coords)
         
         # 构建邻接矩阵

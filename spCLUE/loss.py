@@ -298,8 +298,15 @@ class ClusterLoss(nn.Module):
             mask[i + n_classes, i] = 0
         mask = mask.bool()
         return mask
+    
+    def target_distribution(self, q: torch.Tensor, eps=1e-12):
+        # q: [N, K], rows sum to 1
+        weight = (q ** 2) / (q.sum(dim=0, keepdim=True) + eps)   # [N, K]
+        p = weight / (weight.sum(dim=1, keepdim=True) + eps)     # [N, K]
+        return p
 
     def forward(self, c_i, c_j):
+        
         p_i = c_i.sum(dim=0).view(-1)
         p_i /= p_i.sum()
         neg_entropy_i = math.log(p_i.size(0)) + (p_i * torch.log(p_i)).sum()
@@ -308,8 +315,12 @@ class ClusterLoss(nn.Module):
         neg_entropy_j = math.log(p_j.size(0)) + (p_j * torch.log(p_j)).sum()
         neg_entropy_loss = neg_entropy_i + neg_entropy_j
 
+        # c_i_sharp = self.target_distribution(c_i)
+        # c_j_sharp = self.target_distribution(c_j)
+
         c_i = c_i.t()
         c_j = c_j.t()
+
         N = 2 * self.n_classes
         c = torch.cat((c_i, c_j), dim=0)
 
@@ -422,7 +433,7 @@ class LocalAggregationContrastiveLoss(nn.Module):
     - 负样本: 中心点 vs 随机聚合的伪向量 (Center <-> Fake Readout)
       (Fake Readout 由随机选择的 'num_mix' 个样本平均而成)
     """
-    def __init__(self, num_mix=10, temperature=1.0):
+    def __init__(self, num_mix=8, temperature=1.0):
         """
         Args:
             num_mix: 负样本聚合的采样数量 (a)
@@ -486,8 +497,8 @@ class LocalAggregationContrastiveLoss(nn.Module):
         """
         # --- 准备工作 ---
         # 归一化 (保证余弦相似度)
-        z1 = F.normalize(z1, p=2, dim=1)
-        z2 = F.normalize(z2, p=2, dim=1)
+        # z1 = F.normalize(z1, p=2, dim=1)
+        # z2 = F.normalize(z2, p=2, dim=1)
         
         # 计算真实邻域 (Positive Context)
         avg_z1 = self.compute_avg_readout(z1, adj1) # 空间邻域
@@ -595,153 +606,77 @@ class MSELoss(nn.Module):
 
 class SCELoss(nn.Module):
     """
-    Symmetric Cross Entropy Loss
-    适用于稀疏数据的重构损失
+    Scaled Cosine Error (SCE) Loss
+    GraphMAE / MaskGAE 标准重构损失
+    关注向量的方向一致性，而非模长
     """
-    def __init__(self, alpha=0.1, beta=1.0, eps=1e-8):
+    def __init__(self, alpha=3.0):
+        """
+        Args:
+            alpha: 缩放指数 (gamma)，通常取 1.0 到 3.0 之间。GraphMAE 默认为 3.0
+        """
         super(SCELoss, self).__init__()
         self.alpha = alpha
-        self.beta = beta
-        self.eps = eps
 
     def forward(self, x_rec, x_target):
         """
         Args:
-            x_rec: [n_samples × n_features] 重构的特征
-            x_target: [n_samples × n_features] 真实特征
-        
-        Returns:
-            loss: 标量
+            x_rec: [batch_size, n_features] 重构特征
+            x_target: [batch_size, n_features] 原始特征
         """
-        # 确保非负并归一化
-        x_rec = torch.clamp(x_rec, min=self.eps)
-        x_target = torch.clamp(x_target, min=self.eps)
+        # 1. L2 归一化 (沿特征维度 dim=1)
+        # 这步操作让模长变为 1，只保留方向信息
+        x_rec_norm = F.normalize(x_rec, p=2, dim=1)
+        x_target_norm = F.normalize(x_target, p=2, dim=1)
         
-        x_rec_norm = x_rec / (x_rec.sum(dim=1, keepdim=True) + self.eps)
-        x_target_norm = x_target / (x_target.sum(dim=1, keepdim=True) + self.eps)
+        # 2. 计算余弦相似度 (Cosine Similarity)
+        # sum(a * b) 等价于 dot product
+        cosine_sim = (x_rec_norm * x_target_norm).sum(dim=1)
         
-        # Cross Entropy: -Σ target·log(rec)
-        ce = -torch.sum(x_target_norm * torch.log(x_rec_norm + self.eps), dim=1)
+        # 3. 计算 Scaled Cosine Error
+        # loss = (1 - cos_sim)^alpha
+        loss = (1 - cosine_sim).pow_(self.alpha)
         
-        # Reverse Cross Entropy: -Σ rec·log(target)
-        rce = -torch.sum(x_rec_norm * torch.log(x_target_norm + self.eps), dim=1)
-        
-        # Symmetric CE
-        loss = (self.alpha * ce + self.beta * rce).mean()
-        
-        return loss
-
-
-# 🔥 新增：置信度加权的聚类对齐损失
-# class ConfidenceWeightedClusterLoss(nn.Module):
+        # 4. 返回平均损失
+        return loss.mean()
+# class SCELoss(nn.Module):
 #     """
-#     基于置信度的聚类对齐损失
-#     在高置信度区域强对齐，低置信度区域弱对齐
+#     Symmetric Cross Entropy Loss
+#     适用于稀疏数据的重构损失
 #     """
-#     def __init__(
-#         self,
-#         n_classes,
-#         weight_strategy='min',  # 'min', 'avg', 'max'
-#         temperature=1.0,
-#         eps=1e-8
-#     ):
-#         super(ConfidenceWeightedClusterLoss, self).__init__()
-#         self.n_classes = n_classes
-#         self.weight_strategy = weight_strategy
-#         self.temperature = temperature
+#     def __init__(self, alpha=0.1, beta=1.0, eps=1e-8):
+#         super(SCELoss, self).__init__()
+#         self.alpha = alpha
+#         self.beta = beta
 #         self.eps = eps
-        
-#         # 最大熵（用于归一化）
-#         self.max_entropy = math.log(n_classes)
-    
-#     def compute_entropy(self, Q):
-#         """
-#         计算熵 H(Q) = -Σ Q·log(Q)
-        
-#         Args:
-#             Q: [n_spots × n_clusters] 聚类概率分布
-        
-#         Returns:
-#             H:  [n_spots] 每个spot的熵
-#         """
-#         # 避免log(0)
-#         Q_safe = torch.clamp(Q, min=self.eps)
-        
-#         # H = -Σ P·log(P)
-#         entropy = -(Q_safe * torch.log(Q_safe)).sum(dim=1)
-        
-#         return entropy
-    
-#     def compute_confidence(self, Q):
-#         """
-#         计算置信度 = 1 - H/H_max
-        
-#         Returns:
-#             conf: [n_spots] 每个spot的置信度，范围[0, 1]
-#         """
-#         H = self.compute_entropy(Q)
-#         conf = 1.0 - H / self.max_entropy
-#         return conf
-    
-#     def compute_alignment_weight(self, conf1, conf2):
-#         """
-#         根据两个视图的置信度计算对齐权重
-        
-#         Args:
-#             conf1, conf2: [n_spots] 两个视图的置信度
-        
-#         Returns:
-#             weight: [n_spots] 对齐权重
-#         """
-#         if self.weight_strategy == 'min': 
-#             # 保守策略：只在两个都确定时强对齐
-#             weight = torch.min(conf1, conf2)
-#         elif self.weight_strategy == 'avg':
-#             # 平衡策略
-#             weight = (conf1 + conf2) / 2.0
-#         elif self.weight_strategy == 'max':
-#             # 激进策略：只要有一个确定就强对齐
-#             weight = torch.max(conf1, conf2)
-#         else:
-#             raise ValueError(f"Unknown weight_strategy: {self.weight_strategy}")
-        
-#         return weight*0.9 + 0.1 # 避免权重为0
-    
-#     def forward(self, Q1, Q2):
+
+#     def forward(self, x_rec, x_target):
 #         """
 #         Args:
-#             Q1: [n_spots × n_clusters] 视图1的聚类分配
-#             Q2: [n_spots × n_clusters] 视图2的聚类分配
-        
+#             x_rec: [n_samples × n_features] 重构的特征
+#             x_target: [n_samples × n_features] 真实特征
 #         Returns:
+
 #             loss: 标量
 #         """
-#         # 1.计算两个视图的置信度
-#         conf1 = self.compute_confidence(Q1)
-#         conf2 = self.compute_confidence(Q2)
+#         # 确保非负并归一化
+#         x_rec = torch.clamp(x_rec, min=self.eps)
+#         x_target = torch.clamp(x_target, min=self.eps)
 
-#         entropy1 = self.compute_entropy(Q1)
-#         entropy2 = self.compute_entropy(Q2)
-        
-#         # 2.计算对齐权重
-#         weight = self.compute_alignment_weight(conf1, conf2)
-        
-#         # 3.计算加权的对齐损失（MSE）
-#         alignment_loss = torch.square(Q1 - Q2).sum(dim=1)  # [n_spots]
-#         weighted_loss = (weight * alignment_loss).mean()
-        
-#         # 4.负熵正则（鼓励均匀的聚类分布，防止所有点聚到一个类）
-#         p1 = Q1.sum(dim=0) / (Q1.sum() + self.eps)
-#         p2 = Q2.sum(dim=0) / (Q2.sum() + self.eps)
-        
-#         neg_entropy1 = self.max_entropy + (p1 * torch.log(p1 + self.eps)).sum()
-#         neg_entropy2 = self.max_entropy + (p2 * torch.log(p2 + self.eps)).sum()
-#         neg_entropy_loss = (neg_entropy1 + neg_entropy2) / 2.0
+#         x_rec_norm = x_rec / (x_rec.sum(dim=1, keepdim=True) + self.eps)
 
-#         entropy_penalty = (entropy1.mean() + entropy2.mean()) / 2.0
-        
-#         # return weighted_loss + 0.5 * neg_entropy_loss + 0.05* entropy_penalty
-#         return alignment_loss, weighted_loss,  neg_entropy_loss,  entropy_penalty
+#         x_target_norm = x_target / (x_target.sum(dim=1, keepdim=True) + self.eps)
+
+#         # Cross Entropy: -Σ target·log(rec)
+#         ce = -torch.sum(x_target_norm * torch.log(x_rec_norm + self.eps), dim=1)
+
+#         # Reverse Cross Entropy: -Σ rec·log(target)
+#         rce = -torch.sum(x_rec_norm * torch.log(x_target_norm + self.eps), dim=1)
+
+#         # Symmetric CE
+#         loss = (self.alpha * ce + self.beta * rce).mean()
+#         return loss
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
