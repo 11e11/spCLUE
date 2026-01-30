@@ -147,3 +147,132 @@ class ZINBLoss(nn.Module):
 
         result = torch.mean(result)
         return result
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GraphGuidedContrastiveLoss(nn.Module):
+    """
+    Gated graph-guided contrastive loss with boundary filtering.
+    Only compute loss for:
+      1. High-confidence edges (top weight percentile)
+      2. Non-boundary nodes (consistent predictions)
+    """
+    def __init__(self, temperature=0.2, k_pos=2, k_neg=256, n_anchors=1024):
+        super().__init__()
+        self.temperature = temperature
+        self.k_pos = k_pos        # Reduced from 3 to 2 for stricter positives
+        self.k_neg = k_neg        
+        self.n_anchors = n_anchors
+    
+    def forward(self, z, neighbors, weights, pred_labels1, pred_labels2, 
+                weight_threshold=0.0, eps=1e-8):
+        """
+        Args:
+            z: fused embeddings [N, D]
+            neighbors: [N, k_c] pre-computed neighbor indices
+            weights: [N, k_c] edge weights
+            pred_labels1: predictions from view 1 [N, n_clusters] (softmax output)
+            pred_labels2: predictions from view 2 [N, n_clusters]
+            weight_threshold: minimum edge weight to consider (for gating)
+        Returns:
+            gated graph-guided contrastive loss
+        """
+        N, D = z.shape
+        device = z.device
+        
+        # === Gate 1: Identify non-boundary nodes (prediction consistency) ===
+        # Use hard labels for consistency check
+        hard_label1 = pred_labels1.argmax(dim=1)  # [N]
+        hard_label2 = pred_labels2.argmax(dim=1)  # [N]
+        consistent_mask = (hard_label1 == hard_label2)  # [N], True for non-boundary
+        
+        # Additionally, check prediction confidence (max prob > 0.6)
+        max_prob1 = pred_labels1.max(dim=1)[0]
+        max_prob2 = pred_labels2.max(dim=1)[0]
+        confident_mask = (max_prob1 > 0) & (max_prob2 > 0)
+        
+        # Combined gate: consistent AND confident
+        valid_anchor_mask = consistent_mask & confident_mask  # [N]
+        valid_anchor_indices = torch.where(valid_anchor_mask)[0]
+        
+        if len(valid_anchor_indices) == 0:
+            # No valid anchors, return zero loss
+            return torch.tensor(0.0, device=device)
+        
+        # Normalize embeddings
+        z_norm = F.normalize(z, p=2, dim=1)
+        
+        # === Sample anchors from valid (non-boundary) nodes ===
+        n_valid = len(valid_anchor_indices)
+        if self.n_anchors < n_valid:
+            sample_idx = torch.randperm(n_valid, device=device)[:self.n_anchors]
+            anchor_idx = valid_anchor_indices[sample_idx]
+        else:
+            anchor_idx = valid_anchor_indices
+        
+        n_actual_anchors = anchor_idx.size(0)
+        
+        # Get anchor embeddings
+        z_anchor = z_norm[anchor_idx]  # [n_anchors, D]
+        
+        # === Gate 2: Filter neighbors by edge weight (only high-confidence) ===
+        anchor_neighbors = neighbors[anchor_idx]  # [n_anchors, k_c]
+        anchor_weights = weights[anchor_idx]      # [n_anchors, k_c]
+        
+        # Mask out low-weight neighbors
+        high_conf_mask = anchor_weights >= weight_threshold  # [n_anchors, k_c]
+        
+        # For each anchor, sample k_pos positives from high-confidence neighbors
+        pos_indices_list = []
+        valid_anchor_list = []
+        
+        for i in range(n_actual_anchors):
+            valid_neighbors = anchor_neighbors[i][high_conf_mask[i]]
+            
+            if len(valid_neighbors) < self.k_pos:
+                # Not enough high-confidence neighbors, skip this anchor
+                continue
+            
+            # Randomly sample k_pos from valid neighbors
+            perm = torch.randperm(len(valid_neighbors), device=device)[:self.k_pos]
+            pos_idx = valid_neighbors[perm]
+            
+            pos_indices_list.append(pos_idx)
+            valid_anchor_list.append(i)
+        
+        if len(valid_anchor_list) == 0:
+            # No anchors have enough high-confidence neighbors
+            return torch.tensor(0.0, device=device)
+        
+        # Stack valid anchors and their positives
+        valid_anchor_list = torch.tensor(valid_anchor_list, dtype=torch.long, device=device)
+        z_anchor_valid = z_anchor[valid_anchor_list]  # [n_valid_anchors, D]
+        pos_indices = torch.stack(pos_indices_list)    # [n_valid_anchors, k_pos]
+        
+        n_valid_anchors = len(valid_anchor_list)
+        
+        # Get positive embeddings
+        z_pos = z_norm[pos_indices.flatten()].view(n_valid_anchors, self.k_pos, D)
+        
+        # === Sample negative samples (random, excluding positives) ===
+        neg_idx = torch.randint(0, N, (n_valid_anchors, self.k_neg), device=device)
+        z_neg = z_norm[neg_idx]  # [n_valid_anchors, k_neg, D]
+        
+        # === Compute similarities ===
+        sim_pos = torch.sum(z_anchor_valid.unsqueeze(1) * z_pos, dim=2) / self.temperature
+        sim_neg = torch.sum(z_anchor_valid.unsqueeze(1) * z_neg, dim=2) / self.temperature
+        
+        # InfoNCE loss
+        pos_exp = torch.exp(sim_pos).sum(dim=1)
+        neg_exp = torch.exp(sim_neg).sum(dim=1)
+        
+        loss = -torch.log(pos_exp / (pos_exp + neg_exp + eps))
+        
+        # Log gating statistics
+        # if torch.rand(1).item() < 0.01:  # Log 1% of the time to avoid spam
+        boundary_ratio = (~consistent_mask).float().mean().item()
+        valid_ratio = n_valid_anchors / N
+        print(f"   [Gating] Boundary: {boundary_ratio:.1%}, Valid anchors: {valid_ratio:.1%}")
+        
+        return loss.mean()

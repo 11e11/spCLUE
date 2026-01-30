@@ -78,6 +78,13 @@ class CCGCN(Module):
             nn.Softmax(dim=1),
         )
 
+        self.projectGrpHead = nn.Sequential(
+            nn.Linear(self.z_dim, self.z_dim),
+            nn.ReLU(),
+            nn.Linear(self.z_dim, self.z_dim),
+            nn.ReLU(),
+        )
+
     def encoder(self, data, adj):
         feature = self.noiseLayer(data)
         adj1 = torch.sparse_coo_tensor(
@@ -122,11 +129,22 @@ class CCGCN(Module):
 
         # + attention fuse
         z = torch.stack([z1_norm, z2_norm], dim=1)
-        z, _ = self.attention(z)
+        z, att_beta = self.attention(z)
+        z_grp = self.projectGrpHead(z)
+        # z = 0.5 * z1_norm + 0.5 * z2_norm
+        # z = normalize(z, p=2, dim=1)
 
         x_Rec = self.relu(z @ self.Transform2.W.data.T) @ self.Transform1.W.data.T
 
-        return h1_norm, h2_norm, z1_norm, z2_norm, z, label1, label2, x_Rec
+        # rec_1 = z1_norm @ self.Transform2.W.t()
+        # rec_2 = z2_norm @ self.Transform2.W.t()
+
+        # # 合并隐藏层特征
+        # rec_hidden = (rec_1 + rec_2) / 2  # 或者直接相加
+
+        # # 最后一层解码
+        # x_Rec = self.relu(rec_hidden) @ self.Transform1.W.t()
+        return h1_norm, h2_norm, z1_norm, z2_norm, z, z_grp, att_beta, label1, label2, x_Rec
 
 
 class CCGCNs(Module):
