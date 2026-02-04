@@ -212,7 +212,7 @@ class spCLUE:
                 predLabel2_np = predlabel2.detach().cpu().numpy().argmax(axis=1)
                 cur_ari = adjusted_rand_score(predLabel1_np, predLabel2_np)
                 print(f"epoch {epoch + 1}: {cur_ari}")
-                print(f"  Batch Loss: {cur_batch_loss.item():.4f}, Cluster Loss: {cur_cluster_loss.item():.4f}, Rec Loss: {cur_rec_expr_loss.item():.4f}, Contrastive Loss: {cur_contrastive_loss.item():.4f}, GraphGuided Loss: {cur_graph_guided_loss.item():.4f},Delta: {cur_delta:.4f}, Beta: {self.beta}, Kappa: {self.kappa}")
+                print(f"  Batch Loss: {cur_batch_loss.item():.4f}, Cluster Loss: {cur_cluster_loss.item():.4f}, Rec Loss: {cur_rec_expr_loss.item():.4f}, Contrastive Loss: {cur_contrastive_loss.item():.4f},GraphGuided Loss: {cur_graph_guided_loss.item():.4f},Delta: {cur_delta:.4f}, Beta: {self.beta}, Kappa: {self.kappa}")
                 
             if (epoch + 1) % 100 == 0:
                 if cur_ari >= max_ari:

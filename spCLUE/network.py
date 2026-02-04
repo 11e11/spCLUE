@@ -59,7 +59,7 @@ class CCGCN(Module):
         self.Transform2 = TransForm_W(self.hidden_dim, self.z_dim, self.dropout)
 
         self.act = nn.ELU()
-        self.relu = nn.ReLU()
+        self.relu = nn.PReLU()
         self.attention = AttentionBlock(self.z_dim)
 
         ## + instance projection head

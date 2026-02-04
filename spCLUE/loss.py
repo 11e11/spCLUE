@@ -190,6 +190,10 @@ class GraphGuidedContrastiveLoss(nn.Module):
         # Additionally, check prediction confidence (max prob > 0.6)
         max_prob1 = pred_labels1.max(dim=1)[0]
         max_prob2 = pred_labels2.max(dim=1)[0]
+        # print("Max prob1 stats: min {:.4f}, max {:.4f}, mean {:.4f}".format(
+        #     max_prob1.min().item(), max_prob1.max().item(), max_prob1.mean().item()))
+        # print("Max prob2 stats: min {:.4f}, max {:.4f}, mean {:.4f}".format(
+        #     max_prob2.min().item(), max_prob2.max().item(), max_prob2.mean().item()))
         confident_mask = (max_prob1 > 0) & (max_prob2 > 0)
         
         # Combined gate: consistent AND confident
