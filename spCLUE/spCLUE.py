@@ -132,8 +132,9 @@ class spCLUE:
             )
             predLabel = self.model.getCluster(features_fuse)
             features_fuse = features_fuse.detach().cpu().numpy()
+            features_spa = feature_spa.detach().cpu().numpy()
             predLabel = predLabel.detach().cpu().numpy()
-            return predLabel, features_fuse
+            return predLabel, features_fuse, features_spa
 
     def train(self):
         self.instance_crit = ContrastiveLoss()
@@ -216,8 +217,8 @@ class spCLUE:
                 
             if (epoch + 1) % 100 == 0:
                 if cur_ari >= max_ari:
-                    predLabel, features_fuse = self.updateResult()
-                    return predLabel, features_fuse, att_beta
+                    predLabel, features_fuse, features_spa = self.updateResult()
+                    return predLabel, features_fuse, features_spa, att_beta
 
         print("Training Finished =================<")
         with torch.no_grad():
@@ -227,9 +228,10 @@ class spCLUE:
             )
             predLabel = self.model.getCluster(features_fuse)
             features_fuse = features_fuse.detach().cpu().numpy()
+            features_spa = feature_spa.detach().cpu().numpy()
             predLabel = predLabel.detach().cpu().numpy()
 
-        return predLabel, features_fuse, att_beta
+        return predLabel, features_fuse,features_spa, att_beta
 
     def trainBatch(self):
         self.instance_crit = ContrastiveLoss()
