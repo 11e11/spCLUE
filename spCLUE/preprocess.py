@@ -115,79 +115,189 @@ def symm_norm(adj, weightDiag=.3, eps=1e-8):
     return adj_self
 
 
-def prepare_graph(adata, key="spatial", n_neighbors=12, n_comps=50, 
-                  metric="cosine",  # 新增参数：cosine 或 euclidean
-                  svd_solver="randomized", self_weight=0.3):
+# def prepare_graph(adata, key="spatial", n_neighbors=12, n_comps=50, 
+#                   metric="cosine",  # 新增参数：cosine 或 euclidean
+#                   svd_solver="randomized", self_weight=0.3):
     
+#     n_spots = adata.shape[0]
+#     print(f"正在构建图: {key}, 使用度量: {metric} ...")
+
+#     # ==========================================
+#     # 1. 准备特征数据 (Feature Preparation)
+#     # ==========================================
+#     if key == "spatial":
+#         # 空间图通常依然使用欧氏距离（物理距离）
+#         X_data = adata.obsm[key]
+#         use_metric = 'euclidean' 
+#         print("  -> 使用空间坐标 (euclidean)")
+        
+#     else: # expr
+#         print("  -> 使用 PCA 表达特征")
+#         # 计算 PCA
+#         if 'X_pca' in adata.obsm:
+#              X_data = adata.obsm['X_pca'][:, :n_comps]
+#         else:
+#             X_data = PCA(n_components=n_comps, random_state=0, svd_solver=svd_solver).fit_transform(adata.X)
+        
+#         # 处理度量标准
+#         if metric == "cosine":
+#             # 技巧：余弦距离等价于 L2 归一化后的欧氏距离
+#             # 先对向量做 L2 归一化，后续直接用 KNN 的 euclidean 搜索，速度极快
+#             X_data = normalize(X_data, norm='l2', axis=1)
+#             use_metric = 'euclidean' 
+#         else:
+#             use_metric = 'euclidean' # 默认为欧氏距离
+
+#     # ==========================================
+#     # 2. 构建 KNN 图 (Efficient KNN Construction)
+#     # ==========================================
+#     print("  -> 计算最近邻 (NearestNeighbors)...")
+    
+#     # 使用 sklearn 的算法，复杂度 O(N log N)，避免 O(N^2) 矩阵
+#     # n_neighbors + 1 是因为 KNN 会把自己算作第1个邻居（距离为0），需要剔除
+#     nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1, metric=use_metric, algorithm='auto')
+#     nbrs.fit(X_data)
+    
+#     # mode='connectivity' 直接返回稀疏矩阵 (CSR)，且只有 0/1 (二值化)
+#     # 这对应了原代码中的 adjBip = np.where(weights > adjFilter, 1, 0)
+#     # 且不再需要手动 sort 和 threshold，sklearn 全帮我们做好了
+#     knn_graph = nbrs.kneighbors_graph(X_data, mode='connectivity')
+    
+#     # 剔除对角线 (自己连自己)
+#     knn_graph.setdiag(0)
+#     knn_graph.eliminate_zeros()
+    
+#     # ==========================================
+#     # 3. 对称化处理 (Symmetrization)
+#     # ==========================================
+#     # 逻辑：A 是 B 的邻居，但 B 不一定是 A 的。我们取并集或交集。
+#     # 原代码逻辑：(W + W.T) / 2 -> 只要有一边连了，权重就变 0.5。
+#     # 这里我们做逻辑 OR：只要是单向邻居，就视为相连 (权重为1)
+    
+#     print("  -> 对称化与归一化...")
+#     # 转为 COO 以便相加
+#     knn_graph = knn_graph.tocoo()
+#     # 这种加法会让双向邻居变成 2，单向邻居变成 1
+#     sym_graph = knn_graph + knn_graph.T 
+    
+#     # 重新二值化：只要大于0就是邻居
+#     sym_graph.data = np.ones_like(sym_graph.data)
+    
+#     # ==========================================
+#     # 4. 归一化 (Normalization)
+#     # ==========================================
+#     # 调用改进后的稀疏归一化函数
+#     norm_adj = symm_norm(sym_graph, weightDiag=self_weight)
+    
+#     print(f"{key} graph created successfully <----\n")
+#     return norm_adj
+
+def prepare_graph(
+    adata, key="spatial", n_neighbors=12, n_comps=50,
+    metric="cosine",
+    svd_solver="randomized",
+    self_weight=0.3,
+    # === 新增：边权模式与相似度转换 ===
+    weight_mode="rbf",      # "rbf" | "inv" | "connectivity"
+    sigma=None,             # rbf核带宽；None则自动估计
+    eps=1e-8,
+):
+    """
+    Build weighted kNN graph.
+
+    Changes vs old version:
+    - Use kneighbors_graph(mode='distance') to get distances
+    - Convert distances -> similarities to obtain meaningful edge weights
+    - Symmetrize by combining directed weights (max/mean)
+    """
+
+    import numpy as np
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import normalize as sk_normalize
+    from sklearn.neighbors import NearestNeighbors
+
     n_spots = adata.shape[0]
     print(f"正在构建图: {key}, 使用度量: {metric} ...")
 
     # ==========================================
-    # 1. 准备特征数据 (Feature Preparation)
+    # 1. 准备特征数据
     # ==========================================
     if key == "spatial":
-        # 空间图通常依然使用欧氏距离（物理距离）
         X_data = adata.obsm[key]
-        use_metric = 'euclidean' 
+        use_metric = "euclidean"
         print("  -> 使用空间坐标 (euclidean)")
-        
-    else: # expr
+    else:  # expr
         print("  -> 使用 PCA 表达特征")
-        # 计算 PCA
-        if 'X_pca' in adata.obsm:
-             X_data = adata.obsm['X_pca'][:, :n_comps]
+        if "X_pca" in adata.obsm:
+            X_data = adata.obsm["X_pca"][:, :n_comps]
         else:
-            X_data = PCA(n_components=n_comps, random_state=0, svd_solver=svd_solver).fit_transform(adata.X)
-        
-        # 处理度量标准
+            X_data = PCA(
+                n_components=n_comps,
+                random_state=0,
+                svd_solver=svd_solver
+            ).fit_transform(adata.X)
+
         if metric == "cosine":
-            # 技巧：余弦距离等价于 L2 归一化后的欧氏距离
-            # 先对向量做 L2 归一化，后续直接用 KNN 的 euclidean 搜索，速度极快
-            X_data = normalize(X_data, norm='l2', axis=1)
-            use_metric = 'euclidean' 
+            # 余弦距离等价于：L2归一化后的欧氏距离
+            X_data = sk_normalize(X_data, norm="l2", axis=1)
+            use_metric = "euclidean"
         else:
-            use_metric = 'euclidean' # 默认为欧氏距离
+            use_metric = "euclidean"
 
     # ==========================================
-    # 2. 构建 KNN 图 (Efficient KNN Construction)
+    # 2. 构建 KNN 图：拿距离而不是二值连接
     # ==========================================
     print("  -> 计算最近邻 (NearestNeighbors)...")
-    
-    # 使用 sklearn 的算法，复杂度 O(N log N)，避免 O(N^2) 矩阵
-    # n_neighbors + 1 是因为 KNN 会把自己算作第1个邻居（距离为0），需要剔除
-    nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1, metric=use_metric, algorithm='auto')
+    nbrs = NearestNeighbors(
+        n_neighbors=n_neighbors + 1,
+        metric=use_metric,
+        algorithm="auto",
+    )
     nbrs.fit(X_data)
-    
-    # mode='connectivity' 直接返回稀疏矩阵 (CSR)，且只有 0/1 (二值化)
-    # 这对应了原代码中的 adjBip = np.where(weights > adjFilter, 1, 0)
-    # 且不再需要手动 sort 和 threshold，sklearn 全帮我们做好了
-    knn_graph = nbrs.kneighbors_graph(X_data, mode='connectivity')
-    
-    # 剔除对角线 (自己连自己)
-    knn_graph.setdiag(0)
-    knn_graph.eliminate_zeros()
-    
+
+    # 关键修改：mode='distance' 取距离（稀疏矩阵）
+    knn_dist = nbrs.kneighbors_graph(X_data, mode="distance")
+    knn_dist.setdiag(0)
+    knn_dist.eliminate_zeros()
+
     # ==========================================
-    # 3. 对称化处理 (Symmetrization)
+    # 2.5 距离 -> 相似度（边权）
     # ==========================================
-    # 逻辑：A 是 B 的邻居，但 B 不一定是 A 的。我们取并集或交集。
-    # 原代码逻辑：(W + W.T) / 2 -> 只要有一边连了，权重就变 0.5。
-    # 这里我们做逻辑 OR：只要是单向邻居，就视为相连 (权重为1)
-    
+    if weight_mode == "connectivity":
+        # 退回旧逻辑：全部置为1（不推荐用于“置信度边权”）
+        knn_w = knn_dist.copy()
+        knn_w.data = np.ones_like(knn_w.data, dtype=np.float32)
+
+    elif weight_mode == "inv":
+        # w = 1 / (d + eps)
+        knn_w = knn_dist.copy()
+        knn_w.data = (1.0 / (knn_w.data + eps)).astype(np.float32)
+
+    elif weight_mode == "rbf":
+        # w = exp(-(d^2)/(2*sigma^2))
+        # sigma 若不提供：用所有kNN距离的中位数做一个稳健估计
+        all_d = knn_dist.data
+        if sigma is None:
+            sigma = np.median(all_d) if len(all_d) > 0 else 1.0
+            sigma = float(max(sigma, eps))
+        knn_w = knn_dist.copy()
+        knn_w.data = np.exp(-(knn_w.data ** 2) / (2.0 * sigma ** 2)).astype(np.float32)
+
+    else:
+        raise ValueError(f"Unknown weight_mode={weight_mode}")
+
+    # ==========================================
+    # 3. 对称化（保留权重）
+    # ==========================================
     print("  -> 对称化与归一化...")
-    # 转为 COO 以便相加
-    knn_graph = knn_graph.tocoo()
-    # 这种加法会让双向邻居变成 2，单向邻居变成 1
-    sym_graph = knn_graph + knn_graph.T 
-    
-    # 重新二值化：只要大于0就是邻居
-    sym_graph.data = np.ones_like(sym_graph.data)
-    
+    knn_w = knn_w.tocsr()
+    # 对称化建议用 max：如果任一方向认为很相似，就保留较大相似度
+    sym_graph = knn_w.maximum(knn_w.T)
+
     # ==========================================
-    # 4. 归一化 (Normalization)
+    # 4. 归一化（沿用你的 symm_norm）
     # ==========================================
-    # 调用改进后的稀疏归一化函数
     norm_adj = symm_norm(sym_graph, weightDiag=self_weight)
-    
+
     print(f"{key} graph created successfully <----\n")
     return norm_adj

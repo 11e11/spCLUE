@@ -274,9 +274,119 @@ class GraphGuidedContrastiveLoss(nn.Module):
         loss = -torch.log(pos_exp / (pos_exp + neg_exp + eps))
         
         # Log gating statistics
-        # if torch.rand(1).item() < 0.01:  # Log 1% of the time to avoid spam
-        boundary_ratio = (~consistent_mask).float().mean().item()
-        valid_ratio = n_valid_anchors / N
-        print(f"   [Gating] Boundary: {boundary_ratio:.1%}, Valid anchors: {valid_ratio:.1%}")
+        if torch.rand(1).item() < 0.01:  # Log 1% of the time to avoid spam
+            boundary_ratio = (~consistent_mask).float().mean().item()
+            valid_ratio = n_valid_anchors / N
+            print(f"   [Gating] Boundary: {boundary_ratio:.1%}, Valid anchors: {valid_ratio:.1%}")
         
         return loss.mean()
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# class GraphGuidedContrastiveLoss(nn.Module):
+#     """
+#     改进版：支持动态正样本采样与边权注入。
+#     适用于高频率 (loss_freq=1)、低强度 (delta=0.1) 的训练模式。
+#     """
+#     def __init__(self, temperature=0.2, k_pos=3, k_neg=256, n_anchors=1024):
+#         super().__init__()
+#         self.temperature = temperature
+#         self.k_pos = k_pos        # 最大正样本数
+#         self.k_neg = k_neg        
+#         self.n_anchors = n_anchors
+
+#     def forward(self, z, neighbors, weights, pred_labels1, pred_labels2, 
+#                 weight_threshold=0.0, eps=1e-8):
+#         N, D = z.shape
+#         device = z.device
+        
+#         # === 1. 门控机制 (Gate 1): 筛选可靠锚点 ===
+#         hard_label1 = pred_labels1.argmax(dim=1)
+#         hard_label2 = pred_labels2.argmax(dim=1)
+#         consistent_mask = (hard_label1 == hard_label2)
+        
+#         # 只要预测一致就作为有效锚点 (去掉了硬性的置信度阈值，改由权重控制)
+#         valid_anchor_indices = torch.where(consistent_mask)[0]
+        
+#         if len(valid_anchor_indices) == 0:
+#             return torch.tensor(0.0, device=device, requires_grad=True)
+        
+#         # 特征归一化
+#         z_norm = F.normalize(z, p=2, dim=1)
+        
+#         # 采样锚点
+#         n_valid = len(valid_anchor_indices)
+#         sel_n_anchors = min(self.n_anchors, n_valid)
+#         anchor_idx = valid_anchor_indices[torch.randperm(n_valid, device=device)[:sel_n_anchors]]
+        
+#         z_anchor = z_norm[anchor_idx] # [n_anchors, D]
+        
+#         # === 2. 动态邻居提取 (Gate 2): 不再直接丢弃，而是按需采样 ===
+#         anchor_neighbors = neighbors[anchor_idx]  # [n_anchors, k_c]
+#         anchor_weights = weights[anchor_idx]      # [n_anchors, k_c]
+        
+#         pos_indices_list = []
+#         pos_weights_list = []
+#         final_anchor_mask = []
+
+#         for i in range(sel_n_anchors):
+#             # 获取满足权重要求的邻居
+#             mask = anchor_weights[i] >= weight_threshold
+#             v_neigh = anchor_neighbors[i][mask]
+#             v_weights = anchor_weights[i][mask]
+            
+#             if len(v_neigh) > 0:
+#                 # 动态采样：如果邻居多于 k_pos 则采样，少于则重复采样补齐
+#                 if len(v_neigh) >= self.k_pos:
+#                     sel = torch.randperm(len(v_neigh), device=device)[:self.k_pos]
+#                 else:
+#                     # 邻居不够时，循环补齐，确保 Tensor 维度整齐
+#                     sel = torch.randint(0, len(v_neigh), (self.k_pos,), device=device)
+                
+#                 pos_indices_list.append(v_neigh[sel])
+#                 pos_weights_list.append(v_weights[sel])
+#                 final_anchor_mask.append(True)
+#             else:
+#                 final_anchor_mask.append(False)
+
+#         if not any(final_anchor_mask):
+#             return torch.tensor(0.0, device=device, requires_grad=True)
+
+#         # 转换为 Tensor
+#         final_anchor_mask = torch.tensor(final_anchor_mask, device=device)
+#         z_anchor = z_anchor[final_anchor_mask]
+#         z_pos_idx = torch.stack(pos_indices_list)    # [n_final, k_pos]
+#         z_pos_weights = torch.stack(pos_weights_list) # [n_final, k_pos]
+        
+#         n_final = z_anchor.size(0)
+        
+#         # 提取正样本特征 [n_final, k_pos, D]
+#         z_pos = z_norm[z_pos_idx.flatten()].view(n_final, self.k_pos, D)
+        
+#         # === 3. 负样本采样 ===
+#         neg_idx = torch.randint(0, N, (n_final, self.k_neg), device=device)
+#         z_neg = z_norm[neg_idx] # [n_final, k_neg, D]
+        
+#         # === 4. 计算相似度并注入边权 ===
+#         # 正样本相似度计算
+#         sim_pos = torch.sum(z_anchor.unsqueeze(1) * z_pos, dim=2) / self.temperature # [n_final, k_pos]
+        
+#         # 核心改进：用共识图权重对相似度进行加权
+#         # 这样权重大的邻居在 Loss 中占据主导地位
+#         weighted_sim_pos = sim_pos * z_pos_weights 
+        
+#         # 负样本相似度
+#         sim_neg = torch.sum(z_anchor.unsqueeze(1) * z_neg, dim=2) / self.temperature # [n_final, k_neg]
+        
+#         # === 5. InfoNCE 计算 ===
+#         pos_exp = torch.exp(weighted_sim_pos).sum(dim=1)
+#         neg_exp = torch.exp(sim_neg).sum(dim=1)
+        
+#         loss = -torch.log(pos_exp / (pos_exp + neg_exp + eps))
+        
+#         # 打印统计信息
+#         if torch.rand(1).item() < 0.05: # 5% 的概率打印，监控锚点率
+#             print(f" > [Contrastive] Active Anchors: {n_final}/{sel_n_anchors} (Rate: {n_final/N:.1%})")
+            
+#         return loss.mean()
