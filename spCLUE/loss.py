@@ -14,6 +14,43 @@ class ContrastiveLoss(nn.Module):
         negScores = torch.exp((x @ xbar.T) / self.temperature).sum(dim=1)
         return -torch.log(posScores / (negScores + eps)).mean()
 
+class CCRLoss(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        # CCR 损失不使用温度系数，它是基于距离/相似度偏差的硬约束 [cite: 256, 263]
+
+    def forward(self, x, xbar):
+        """
+        x: 视图1的嵌入 (N, d), 例如空间图嵌入 E_s
+        xbar: 视图2的嵌入 (N, d), 例如特征图嵌入 E_f
+        """
+        N = x.size(0)
+        
+        # 1. L2 归一化：确保内积等于余弦相似度 
+        x_norm = F.normalize(x, p=2, dim=1)
+        xbar_norm = F.normalize(xbar, p=2, dim=1)
+        
+        # 2. 计算跨视图亲和力矩阵 S (N x N)
+        # S[i, j] 表示视图1的节点 i 与视图2的节点 j 之间的相似度 [cite: 258, 261]
+        S = torch.mm(x_norm, xbar_norm.t())
+        
+        # 3. 计算对角线项 (Consistency)：同一节点在不同视图应高度一致
+        # 目标是让 S[i, i] 趋近于 1 [cite: 263, 265]
+        diag_sim = torch.diag(S)
+        loss_diag = torch.mean((diag_sim - 1) ** 2)
+        
+        # 4. 计算非对角线项 (Discriminability)：不同节点之间应保持区分度
+        # 目标是让 S[i, j] (i != j) 趋近于 0 [cite: 263, 265]
+        # 技巧：先计算矩阵所有元素的平方和，减去对角线元素的平方和
+        all_sq = S ** 2
+        off_diag_sq_sum = all_sq.sum() - (diag_sim ** 2).sum()
+        
+        # 归一化系数为 N(N-1) [cite: 263]
+        loss_off_diag = off_diag_sq_sum / (N * (N - 1))
+        
+        # 总损失 [cite: 263]
+        return loss_diag + loss_off_diag
+
 class ClusterLoss(nn.Module):
     def __init__(
             self,
@@ -126,9 +163,10 @@ class ZINBLoss(nn.Module):
               scale_factor, [n,]
         '''
         eps = 1e-10
-        mean = (mean.T * scale_factor).T
-        if pi == 0:
-            pi = torch.tensor(0.0)
+        disp = torch.clamp(disp, max=1e6)
+        # mean = (mean.T * scale_factor).T
+        # if pi == 0:
+        #     pi = torch.tensor(0.0)
 
         t1 = torch.lgamma(disp + eps) + torch.lgamma(x + 1.0) - torch.lgamma(
             x + disp + eps)
@@ -147,246 +185,41 @@ class ZINBLoss(nn.Module):
 
         result = torch.mean(result)
         return result
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# class ZINBLoss(nn.Module):
+#     def forward(self, x, mean, disp, pi, ridge_lambda=0.0):
+#         eps = 1e-10
+        
+#         # 1. 对 disp 进行截断，防止 lgamma 爆炸 (MAFN 核心逻辑)
+#         disp = torch.clamp(disp, max=1e6)
+        
+#         # 2. 负二项分布(NB)部分的似然计算
+#         # t1 部分处理伽马函数
+#         t1 = torch.lgamma(disp + eps) + torch.lgamma(x + 1.0) - torch.lgamma(x + disp + eps)
+#         # t2 部分处理均值和离散度的对数关系
+#         t2 = (disp + x) * torch.log(1.0 + (mean / (disp + eps))) + (
+#             x * (torch.log(disp + eps) - torch.log(mean + eps)))
+        
+#         nb_final = t1 + t2
+        
+#         # 3. ZINB 分支逻辑
+#         # 当 x > 0 时的损失 (仅来自非零部分)
+#         nb_case = nb_final - torch.log(1.0 - pi + eps)
+        
+#         # 当 x = 0 时的损失 (来自 Dropout + NB 产生的 0)
+#         # zero_nb 表示 NB 分布产生 0 的概率: (disp / (disp + mean))^disp
+#         zero_nb = torch.pow(disp / (disp + mean + eps), disp)
+#         zero_case = -torch.log(pi + ((1.0 - pi) * zero_nb) + eps)
+        
+#         # 4. 根据 x 是否为 0 进行选择
+#         result = torch.where(torch.le(x, 1e-8), zero_case, nb_case)
 
-class GraphGuidedContrastiveLoss(nn.Module):
-    """
-    Gated graph-guided contrastive loss with boundary filtering.
-    Only compute loss for:
-      1. High-confidence edges (top weight percentile)
-      2. Non-boundary nodes (consistent predictions)
-    """
-    def __init__(self, temperature=0.2, k_pos=2, k_neg=256, n_anchors=1024):
-        super().__init__()
-        self.temperature = temperature
-        self.k_pos = k_pos        # Reduced from 3 to 2 for stricter positives
-        self.k_neg = k_neg        
-        self.n_anchors = n_anchors
-    
-    def forward(self, z, neighbors, weights, pred_labels1, pred_labels2, 
-                weight_threshold=0.0, eps=1e-8):
-        """
-        Args:
-            z: fused embeddings [N, D]
-            neighbors: [N, k_c] pre-computed neighbor indices
-            weights: [N, k_c] edge weights
-            pred_labels1: predictions from view 1 [N, n_clusters] (softmax output)
-            pred_labels2: predictions from view 2 [N, n_clusters]
-            weight_threshold: minimum edge weight to consider (for gating)
-        Returns:
-            gated graph-guided contrastive loss
-        """
-        N, D = z.shape
-        device = z.device
-        
-        # === Gate 1: Identify non-boundary nodes (prediction consistency) ===
-        # Use hard labels for consistency check
-        hard_label1 = pred_labels1.argmax(dim=1)  # [N]
-        hard_label2 = pred_labels2.argmax(dim=1)  # [N]
-        consistent_mask = (hard_label1 == hard_label2)  # [N], True for non-boundary
-        
-        # Additionally, check prediction confidence (max prob > 0.6)
-        max_prob1 = pred_labels1.max(dim=1)[0]
-        max_prob2 = pred_labels2.max(dim=1)[0]
-        # print("Max prob1 stats: min {:.4f}, max {:.4f}, mean {:.4f}".format(
-        #     max_prob1.min().item(), max_prob1.max().item(), max_prob1.mean().item()))
-        # print("Max prob2 stats: min {:.4f}, max {:.4f}, mean {:.4f}".format(
-        #     max_prob2.min().item(), max_prob2.max().item(), max_prob2.mean().item()))
-        confident_mask = (max_prob1 > 0) & (max_prob2 > 0)
-        
-        # Combined gate: consistent AND confident
-        valid_anchor_mask = consistent_mask & confident_mask  # [N]
-        valid_anchor_indices = torch.where(valid_anchor_mask)[0]
-        
-        if len(valid_anchor_indices) == 0:
-            # No valid anchors, return zero loss
-            return torch.tensor(0.0, device=device)
-        
-        # Normalize embeddings
-        z_norm = F.normalize(z, p=2, dim=1)
-        
-        # === Sample anchors from valid (non-boundary) nodes ===
-        n_valid = len(valid_anchor_indices)
-        if self.n_anchors < n_valid:
-            sample_idx = torch.randperm(n_valid, device=device)[:self.n_anchors]
-            anchor_idx = valid_anchor_indices[sample_idx]
-        else:
-            anchor_idx = valid_anchor_indices
-        
-        n_actual_anchors = anchor_idx.size(0)
-        
-        # Get anchor embeddings
-        z_anchor = z_norm[anchor_idx]  # [n_anchors, D]
-        
-        # === Gate 2: Filter neighbors by edge weight (only high-confidence) ===
-        anchor_neighbors = neighbors[anchor_idx]  # [n_anchors, k_c]
-        anchor_weights = weights[anchor_idx]      # [n_anchors, k_c]
-        
-        # Mask out low-weight neighbors
-        high_conf_mask = anchor_weights >= weight_threshold  # [n_anchors, k_c]
-        
-        # For each anchor, sample k_pos positives from high-confidence neighbors
-        pos_indices_list = []
-        valid_anchor_list = []
-        
-        for i in range(n_actual_anchors):
-            valid_neighbors = anchor_neighbors[i][high_conf_mask[i]]
-            
-            if len(valid_neighbors) < self.k_pos:
-                # Not enough high-confidence neighbors, skip this anchor
-                continue
-            
-            # Randomly sample k_pos from valid neighbors
-            perm = torch.randperm(len(valid_neighbors), device=device)[:self.k_pos]
-            pos_idx = valid_neighbors[perm]
-            
-            pos_indices_list.append(pos_idx)
-            valid_anchor_list.append(i)
-        
-        if len(valid_anchor_list) == 0:
-            # No anchors have enough high-confidence neighbors
-            return torch.tensor(0.0, device=device)
-        
-        # Stack valid anchors and their positives
-        valid_anchor_list = torch.tensor(valid_anchor_list, dtype=torch.long, device=device)
-        z_anchor_valid = z_anchor[valid_anchor_list]  # [n_valid_anchors, D]
-        pos_indices = torch.stack(pos_indices_list)    # [n_valid_anchors, k_pos]
-        
-        n_valid_anchors = len(valid_anchor_list)
-        
-        # Get positive embeddings
-        z_pos = z_norm[pos_indices.flatten()].view(n_valid_anchors, self.k_pos, D)
-        
-        # === Sample negative samples (random, excluding positives) ===
-        neg_idx = torch.randint(0, N, (n_valid_anchors, self.k_neg), device=device)
-        z_neg = z_norm[neg_idx]  # [n_valid_anchors, k_neg, D]
-        
-        # === Compute similarities ===
-        sim_pos = torch.sum(z_anchor_valid.unsqueeze(1) * z_pos, dim=2) / self.temperature
-        sim_neg = torch.sum(z_anchor_valid.unsqueeze(1) * z_neg, dim=2) / self.temperature
-        
-        # InfoNCE loss
-        pos_exp = torch.exp(sim_pos).sum(dim=1)
-        neg_exp = torch.exp(sim_neg).sum(dim=1)
-        
-        loss = -torch.log(pos_exp / (pos_exp + neg_exp + eps))
-        
-        # Log gating statistics
-        if torch.rand(1).item() < 0.01:  # Log 1% of the time to avoid spam
-            boundary_ratio = (~consistent_mask).float().mean().item()
-            valid_ratio = n_valid_anchors / N
-            print(f"   [Gating] Boundary: {boundary_ratio:.1%}, Valid anchors: {valid_ratio:.1%}")
-        
-        return loss.mean()
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+#         # 5. Pi 的正则化 (可选)
+#         if ridge_lambda > 0:
+#             ridge = ridge_lambda * torch.square(pi)
+#             result += ridge
 
-# class GraphGuidedContrastiveLoss(nn.Module):
-#     """
-#     改进版：支持动态正样本采样与边权注入。
-#     适用于高频率 (loss_freq=1)、低强度 (delta=0.1) 的训练模式。
-#     """
-#     def __init__(self, temperature=0.2, k_pos=3, k_neg=256, n_anchors=1024):
-#         super().__init__()
-#         self.temperature = temperature
-#         self.k_pos = k_pos        # 最大正样本数
-#         self.k_neg = k_neg        
-#         self.n_anchors = n_anchors
+#         # 6. 最终稳定性处理 (MAFN 风格)
+#         result = torch.where(torch.isnan(result), torch.full_like(result, float('inf')), result)
+#         result = torch.where(torch.isinf(result), torch.full_like(result, 1e10), result) # 进一步防止 inf
 
-#     def forward(self, z, neighbors, weights, pred_labels1, pred_labels2, 
-#                 weight_threshold=0.0, eps=1e-8):
-#         N, D = z.shape
-#         device = z.device
-        
-#         # === 1. 门控机制 (Gate 1): 筛选可靠锚点 ===
-#         hard_label1 = pred_labels1.argmax(dim=1)
-#         hard_label2 = pred_labels2.argmax(dim=1)
-#         consistent_mask = (hard_label1 == hard_label2)
-        
-#         # 只要预测一致就作为有效锚点 (去掉了硬性的置信度阈值，改由权重控制)
-#         valid_anchor_indices = torch.where(consistent_mask)[0]
-        
-#         if len(valid_anchor_indices) == 0:
-#             return torch.tensor(0.0, device=device, requires_grad=True)
-        
-#         # 特征归一化
-#         z_norm = F.normalize(z, p=2, dim=1)
-        
-#         # 采样锚点
-#         n_valid = len(valid_anchor_indices)
-#         sel_n_anchors = min(self.n_anchors, n_valid)
-#         anchor_idx = valid_anchor_indices[torch.randperm(n_valid, device=device)[:sel_n_anchors]]
-        
-#         z_anchor = z_norm[anchor_idx] # [n_anchors, D]
-        
-#         # === 2. 动态邻居提取 (Gate 2): 不再直接丢弃，而是按需采样 ===
-#         anchor_neighbors = neighbors[anchor_idx]  # [n_anchors, k_c]
-#         anchor_weights = weights[anchor_idx]      # [n_anchors, k_c]
-        
-#         pos_indices_list = []
-#         pos_weights_list = []
-#         final_anchor_mask = []
-
-#         for i in range(sel_n_anchors):
-#             # 获取满足权重要求的邻居
-#             mask = anchor_weights[i] >= weight_threshold
-#             v_neigh = anchor_neighbors[i][mask]
-#             v_weights = anchor_weights[i][mask]
-            
-#             if len(v_neigh) > 0:
-#                 # 动态采样：如果邻居多于 k_pos 则采样，少于则重复采样补齐
-#                 if len(v_neigh) >= self.k_pos:
-#                     sel = torch.randperm(len(v_neigh), device=device)[:self.k_pos]
-#                 else:
-#                     # 邻居不够时，循环补齐，确保 Tensor 维度整齐
-#                     sel = torch.randint(0, len(v_neigh), (self.k_pos,), device=device)
-                
-#                 pos_indices_list.append(v_neigh[sel])
-#                 pos_weights_list.append(v_weights[sel])
-#                 final_anchor_mask.append(True)
-#             else:
-#                 final_anchor_mask.append(False)
-
-#         if not any(final_anchor_mask):
-#             return torch.tensor(0.0, device=device, requires_grad=True)
-
-#         # 转换为 Tensor
-#         final_anchor_mask = torch.tensor(final_anchor_mask, device=device)
-#         z_anchor = z_anchor[final_anchor_mask]
-#         z_pos_idx = torch.stack(pos_indices_list)    # [n_final, k_pos]
-#         z_pos_weights = torch.stack(pos_weights_list) # [n_final, k_pos]
-        
-#         n_final = z_anchor.size(0)
-        
-#         # 提取正样本特征 [n_final, k_pos, D]
-#         z_pos = z_norm[z_pos_idx.flatten()].view(n_final, self.k_pos, D)
-        
-#         # === 3. 负样本采样 ===
-#         neg_idx = torch.randint(0, N, (n_final, self.k_neg), device=device)
-#         z_neg = z_norm[neg_idx] # [n_final, k_neg, D]
-        
-#         # === 4. 计算相似度并注入边权 ===
-#         # 正样本相似度计算
-#         sim_pos = torch.sum(z_anchor.unsqueeze(1) * z_pos, dim=2) / self.temperature # [n_final, k_pos]
-        
-#         # 核心改进：用共识图权重对相似度进行加权
-#         # 这样权重大的邻居在 Loss 中占据主导地位
-#         weighted_sim_pos = sim_pos * z_pos_weights 
-        
-#         # 负样本相似度
-#         sim_neg = torch.sum(z_anchor.unsqueeze(1) * z_neg, dim=2) / self.temperature # [n_final, k_neg]
-        
-#         # === 5. InfoNCE 计算 ===
-#         pos_exp = torch.exp(weighted_sim_pos).sum(dim=1)
-#         neg_exp = torch.exp(sim_neg).sum(dim=1)
-        
-#         loss = -torch.log(pos_exp / (pos_exp + neg_exp + eps))
-        
-#         # 打印统计信息
-#         if torch.rand(1).item() < 0.05: # 5% 的概率打印，监控锚点率
-#             print(f" > [Contrastive] Active Anchors: {n_final}/{sel_n_anchors} (Rate: {n_final/N:.1%})")
-            
-#         return loss.mean()
+#         return torch.mean(result)

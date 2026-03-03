@@ -1,118 +1,118 @@
-import scanpy as sc
-from sklearn.decomposition import PCA
-from scipy.spatial.distance import cdist
-import numpy as np
-import scipy.sparse as sp
-from sklearn.utils import issparse
+# import scanpy as sc
+# from sklearn.decomposition import PCA
+# from scipy.spatial.distance import cdist
+# import numpy as np
+# import scipy.sparse as sp
+# from sklearn.utils import issparse
 
 
 
-def preprocess(adata, hvgNumber=None):
-    print("normalized data ---------------->")
-    sc.pp.filter_genes(adata, min_counts=1)
-    sc.pp.filter_cells(adata, min_counts=1)
-    if issparse(adata.X):
-        adata.layers['count'] = adata.X.copy() # 保持稀疏以节省内存
-    else:
-        adata.layers['count'] = adata.X.copy()
-    if not hvgNumber is None:
-        print(f"========== selecting HVG ============")
-        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", layer="count",n_top_genes=hvgNumber, subset=False)
-        adata = adata[:, adata.var["highly_variable"] == True]
-        sc.pp.scale(adata)
-        return adata
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-    sc.pp.scale(adata)
-    return adata
+# def preprocess(adata, hvgNumber=None):
+#     print("normalized data ---------------->")
+#     sc.pp.filter_genes(adata, min_counts=1)
+#     sc.pp.filter_cells(adata, min_counts=1)
+#     if issparse(adata.X):
+#         adata.layers['count'] = adata.X.copy() # 保持稀疏以节省内存
+#     else:
+#         adata.layers['count'] = adata.X.copy()
+#     if not hvgNumber is None:
+#         print(f"========== selecting HVG ============")
+#         sc.pp.highly_variable_genes(adata, flavor="seurat_v3", layer="count",n_top_genes=hvgNumber, subset=False)
+#         adata = adata[:, adata.var["highly_variable"] == True]
+#         sc.pp.scale(adata)
+#         return adata
+#     sc.pp.normalize_total(adata, target_sum=1e4)
+#     sc.pp.log1p(adata)
+#     sc.pp.scale(adata)
+#     return adata
 
 
-def calcGAEParams(graph, n_samples):
-    '''graph is a bipartite graph, return pos_weight and norm_val
-    '''
-    non_zero_cnt = graph.sum()
-    norm_val = (n_samples * n_samples) / (2 * (n_samples * n_samples - non_zero_cnt))
-    pos_weight = (n_samples * n_samples - non_zero_cnt) / non_zero_cnt
-    return norm_val, pos_weight
+# def calcGAEParams(graph, n_samples):
+#     '''graph is a bipartite graph, return pos_weight and norm_val
+#     '''
+#     non_zero_cnt = graph.sum()
+#     norm_val = (n_samples * n_samples) / (2 * (n_samples * n_samples - non_zero_cnt))
+#     pos_weight = (n_samples * n_samples - non_zero_cnt) / non_zero_cnt
+#     return norm_val, pos_weight
 
 
-def calcGraphWeight(coor, eps=1e-6):
-    dist = cdist(coor, coor, "euclidean")
-    dist = dist / (np.max(dist) + eps)
-    return dist
+# def calcGraphWeight(coor, eps=1e-6):
+#     dist = cdist(coor, coor, "euclidean")
+#     dist = dist / (np.max(dist) + eps)
+#     return dist
 
 
-def correlation_graph(A, B):
-    '''calculate correlation between A and B.
-    Args:
-        A (np.ndarray): sample matrix, shape: [samples, features].
-        B (np.ndarray): sample matrix, shape: [samples, features].
-    Returns: 
-        corr (np.ndarray): correlation matrix of features, shape: [features, features].
-    '''
-    am = A - np.mean(A, axis=0, keepdims=True)
-    bm = B - np.mean(B, axis=0, keepdims=True)
-    return am.T @ bm / (np.sqrt(np.sum(am**2, axis=0, keepdims=True)).T * np.sqrt(np.sum(bm**2, axis=0, keepdims=True)))
+# def correlation_graph(A, B):
+#     '''calculate correlation between A and B.
+#     Args:
+#         A (np.ndarray): sample matrix, shape: [samples, features].
+#         B (np.ndarray): sample matrix, shape: [samples, features].
+#     Returns: 
+#         corr (np.ndarray): correlation matrix of features, shape: [features, features].
+#     '''
+#     am = A - np.mean(A, axis=0, keepdims=True)
+#     bm = B - np.mean(B, axis=0, keepdims=True)
+#     return am.T @ bm / (np.sqrt(np.sum(am**2, axis=0, keepdims=True)).T * np.sqrt(np.sum(bm**2, axis=0, keepdims=True)))
 
 
-import numpy as np
-import scipy.sparse as sp
-from scipy.spatial.distance import cdist
-from sklearn.decomposition import PCA
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import normalize
+# import numpy as np
+# import scipy.sparse as sp
+# from scipy.spatial.distance import cdist
+# from sklearn.decomposition import PCA
+# from sklearn.neighbors import NearestNeighbors
+# from sklearn.preprocessing import normalize
 
-def symm_norm(adj, weightDiag=.3, eps=1e-8):
-    '''
-    保持原有的归一化逻辑不变
-    return: D^{-1/2} (A + I) D^{-1 / 2}
-    '''
-    # 确保是稀疏矩阵操作以节省内存
-    if not sp.issparse(adj):
-        adj = sp.coo_matrix(adj)
+# def symm_norm(adj, weightDiag=.3, eps=1e-8):
+#     '''
+#     保持原有的归一化逻辑不变
+#     return: D^{-1/2} (A + I) D^{-1 / 2}
+#     '''
+#     # 确保是稀疏矩阵操作以节省内存
+#     if not sp.issparse(adj):
+#         adj = sp.coo_matrix(adj)
     
-    n_spot = adj.shape[0]
-    # 对角线处理：(1-w)*A + w*I
-    # 注意：这里为了效率，我们不直接生成 dense 矩阵，而是利用稀疏矩阵特性
-    adj = adj.tocoo()
+#     n_spot = adj.shape[0]
+#     # 对角线处理：(1-w)*A + w*I
+#     # 注意：这里为了效率，我们不直接生成 dense 矩阵，而是利用稀疏矩阵特性
+#     adj = adj.tocoo()
     
-    # 重新构建带权重的邻接矩阵（包含对角线）
-    # 逻辑：非对角线元素 * (1 - weightDiag)
-    adj_data = adj.data * (1 - weightDiag)
-    adj_rows = adj.row
-    adj_cols = adj.col
+#     # 重新构建带权重的邻接矩阵（包含对角线）
+#     # 逻辑：非对角线元素 * (1 - weightDiag)
+#     adj_data = adj.data * (1 - weightDiag)
+#     adj_rows = adj.row
+#     adj_cols = adj.col
     
-    # 添加对角线元素
-    diag_rows = np.arange(n_spot)
-    diag_cols = np.arange(n_spot)
-    diag_data = np.full(n_spot, weightDiag)
+#     # 添加对角线元素
+#     diag_rows = np.arange(n_spot)
+#     diag_cols = np.arange(n_spot)
+#     diag_data = np.full(n_spot, weightDiag)
     
-    # 合并
-    final_rows = np.concatenate([adj_rows, diag_rows])
-    final_cols = np.concatenate([adj_cols, diag_cols])
-    final_data = np.concatenate([adj_data, diag_data])
+#     # 合并
+#     final_rows = np.concatenate([adj_rows, diag_rows])
+#     final_cols = np.concatenate([adj_cols, diag_cols])
+#     final_data = np.concatenate([adj_data, diag_data])
     
-    adj_self = sp.coo_matrix((final_data, (final_rows, final_cols)), shape=(n_spot, n_spot))
+#     adj_self = sp.coo_matrix((final_data, (final_rows, final_cols)), shape=(n_spot, n_spot))
 
-    # 计算度矩阵
-    # sum(axis=1) 对于稀疏矩阵返回的是 np.matrix，需要转为 array
-    degrees = np.array(adj_self.sum(axis=1)).flatten()
-    degrees = 1. / np.sqrt(degrees + eps)
+#     # 计算度矩阵
+#     # sum(axis=1) 对于稀疏矩阵返回的是 np.matrix，需要转为 array
+#     degrees = np.array(adj_self.sum(axis=1)).flatten()
+#     degrees = 1. / np.sqrt(degrees + eps)
     
-    # D^{-1/2} A D^{-1/2}
-    # 利用对角矩阵乘法的性质：行缩放和列缩放
-    # CSR 格式做乘法更高效
-    adj_self = adj_self.tocsr()
+#     # D^{-1/2} A D^{-1/2}
+#     # 利用对角矩阵乘法的性质：行缩放和列缩放
+#     # CSR 格式做乘法更高效
+#     adj_self = adj_self.tocsr()
     
-    # 每一行乘以 degrees (左乘对角矩阵)
-    sp.diags(degrees) @ adj_self @ sp.diags(degrees)
+#     # 每一行乘以 degrees (左乘对角矩阵)
+#     sp.diags(degrees) @ adj_self @ sp.diags(degrees)
     
-    # 注意：scipy 稀疏矩阵乘法会自动处理 broadcasting
-    # 更高效的手动实现：
-    adj_self = adj_self.multiply(degrees[:, None]) # 乘行因子
-    adj_self = adj_self.multiply(degrees[None, :]) # 乘列因子
+#     # 注意：scipy 稀疏矩阵乘法会自动处理 broadcasting
+#     # 更高效的手动实现：
+#     adj_self = adj_self.multiply(degrees[:, None]) # 乘行因子
+#     adj_self = adj_self.multiply(degrees[None, :]) # 乘列因子
     
-    return adj_self
+#     return adj_self
 
 
 # def prepare_graph(adata, key="spatial", n_neighbors=12, n_comps=50, 
@@ -192,112 +192,152 @@ def symm_norm(adj, weightDiag=.3, eps=1e-8):
 #     print(f"{key} graph created successfully <----\n")
 #     return norm_adj
 
-def prepare_graph(
-    adata, key="spatial", n_neighbors=12, n_comps=50,
-    metric="cosine",
-    svd_solver="randomized",
-    self_weight=0.3,
-    # === 新增：边权模式与相似度转换 ===
-    weight_mode="rbf",      # "rbf" | "inv" | "connectivity"
-    sigma=None,             # rbf核带宽；None则自动估计
-    eps=1e-8,
-):
-    """
-    Build weighted kNN graph.
+import scanpy as sc
+from sklearn.decomposition import PCA
+from scipy.spatial.distance import cdist
+import numpy as np
+import scipy.sparse as sp
 
-    Changes vs old version:
-    - Use kneighbors_graph(mode='distance') to get distances
-    - Convert distances -> similarities to obtain meaningful edge weights
-    - Symmetrize by combining directed weights (max/mean)
-    """
 
-    import numpy as np
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import normalize as sk_normalize
-    from sklearn.neighbors import NearestNeighbors
 
-    n_spots = adata.shape[0]
-    print(f"正在构建图: {key}, 使用度量: {metric} ...")
+# def preprocess(adata, hvgNumber=None):
+#     print("normalized data ---------------->")
+#     sc.pp.filter_genes(adata, min_counts=1)
+#     sc.pp.filter_cells(adata, min_counts=1)
+#     if not hvgNumber is None:
+#         print(f"========== selecting HVG ============")
+#         sc.pp.highly_variable_genes(adata, flavor="seurat_v3", layer="count",n_top_genes=hvgNumber, subset=False)
+#         adata = adata[:, adata.var["highly_variable"] == True]
+#         sc.pp.scale(adata)
+#         return adata
+#     sc.pp.normalize_total(adata, target_sum=1e4)
+#     sc.pp.log1p(adata)
+#     sc.pp.scale(adata)
+#     return adata
+def preprocess(adata, hvgNumber=3000):
+    print("Preprocessing starting according to CSMVL description...")
+    
+    # 1. 基因过滤：至少在 100 个 spot 中表达
+    sc.pp.filter_genes(adata, min_cells=100) 
+    sc.pp.filter_cells(adata, min_counts=1)
 
-    # ==========================================
-    # 1. 准备特征数据
-    # ==========================================
-    if key == "spatial":
-        X_data = adata.obsm[key]
-        use_metric = "euclidean"
-        print("  -> 使用空间坐标 (euclidean)")
-    else:  # expr
-        print("  -> 使用 PCA 表达特征")
-        if "X_pca" in adata.obsm:
-            X_data = adata.obsm["X_pca"][:, :n_comps]
-        else:
-            X_data = PCA(
-                n_components=n_comps,
-                random_state=0,
-                svd_solver=svd_solver
-            ).fit_transform(adata.X)
-
-        if metric == "cosine":
-            # 余弦距离等价于：L2归一化后的欧氏距离
-            X_data = sk_normalize(X_data, norm="l2", axis=1)
-            use_metric = "euclidean"
-        else:
-            use_metric = "euclidean"
-
-    # ==========================================
-    # 2. 构建 KNN 图：拿距离而不是二值连接
-    # ==========================================
-    print("  -> 计算最近邻 (NearestNeighbors)...")
-    nbrs = NearestNeighbors(
-        n_neighbors=n_neighbors + 1,
-        metric=use_metric,
-        algorithm="auto",
-    )
-    nbrs.fit(X_data)
-
-    # 关键修改：mode='distance' 取距离（稀疏矩阵）
-    knn_dist = nbrs.kneighbors_graph(X_data, mode="distance")
-    knn_dist.setdiag(0)
-    knn_dist.eliminate_zeros()
-
-    # ==========================================
-    # 2.5 距离 -> 相似度（边权）
-    # ==========================================
-    if weight_mode == "connectivity":
-        # 退回旧逻辑：全部置为1（不推荐用于“置信度边权”）
-        knn_w = knn_dist.copy()
-        knn_w.data = np.ones_like(knn_w.data, dtype=np.float32)
-
-    elif weight_mode == "inv":
-        # w = 1 / (d + eps)
-        knn_w = knn_dist.copy()
-        knn_w.data = (1.0 / (knn_w.data + eps)).astype(np.float32)
-
-    elif weight_mode == "rbf":
-        # w = exp(-(d^2)/(2*sigma^2))
-        # sigma 若不提供：用所有kNN距离的中位数做一个稳健估计
-        all_d = knn_dist.data
-        if sigma is None:
-            sigma = np.median(all_d) if len(all_d) > 0 else 1.0
-            sigma = float(max(sigma, eps))
-        knn_w = knn_dist.copy()
-        knn_w.data = np.exp(-(knn_w.data ** 2) / (2.0 * sigma ** 2)).astype(np.float32)
-
+    if sp.issparse(adata.X):
+        adata.layers['count'] = adata.X.copy() # 保持稀疏以节省内存
     else:
-        raise ValueError(f"Unknown weight_mode={weight_mode}")
+        adata.layers['count'] = adata.X.copy()
+    
+    # 2. 高变基因选择 (使用 seurat_v3 针对 raw count)
+    print(f"Selecting top {hvgNumber} HVGs...")
+    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=hvgNumber, subset=True)
+    
+    # 3. 归一化：target_sum = 10,000
+    print("Normalizing total counts to 10,000...")
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    
+    # 4. 对数变换
+    sc.pp.log1p(adata)
+    
+    # 5. 缩放与裁剪 (max_value=10)
+    print("Scaling and clipping at threshold 10...")
+    sc.pp.scale(adata, max_value=10)
+    
+    return adata
 
-    # ==========================================
-    # 3. 对称化（保留权重）
-    # ==========================================
-    print("  -> 对称化与归一化...")
-    knn_w = knn_w.tocsr()
-    # 对称化建议用 max：如果任一方向认为很相似，就保留较大相似度
-    sym_graph = knn_w.maximum(knn_w.T)
 
-    # ==========================================
-    # 4. 归一化（沿用你的 symm_norm）
-    # ==========================================
-    norm_adj = symm_norm(sym_graph, weightDiag=self_weight)
+def calcGAEParams(graph, n_samples):
+    '''graph is a bipartite graph, return pos_weight and norm_val
+    '''
+    non_zero_cnt = graph.sum()
+    norm_val = (n_samples * n_samples) / (2 * (n_samples * n_samples - non_zero_cnt))
+    pos_weight = (n_samples * n_samples - non_zero_cnt) / non_zero_cnt
+    return norm_val, pos_weight
 
-    print(f"{key} graph created successfully <----\n")
-    return norm_adj
+
+def calcGraphWeight(coor, eps=1e-6):
+    dist = cdist(coor, coor, "euclidean")
+    dist = dist / (np.max(dist) + eps)
+    return dist
+
+
+def correlation_graph(A, B):
+    '''calculate correlation between A and B.
+    Args:
+        A (np.ndarray): sample matrix, shape: [samples, features].
+        B (np.ndarray): sample matrix, shape: [samples, features].
+    Returns: 
+        corr (np.ndarray): correlation matrix of features, shape: [features, features].
+    '''
+    am = A - np.mean(A, axis=0, keepdims=True)
+    bm = B - np.mean(B, axis=0, keepdims=True)
+    return am.T @ bm / (np.sqrt(np.sum(am**2, axis=0, keepdims=True)).T * np.sqrt(np.sum(bm**2, axis=0, keepdims=True)))
+
+
+def prepare_graph(adata, key="spatial", n_neighbors=12, n_comps=50, eps=1e-8, svd_solver="randomized", self_weight=0.3):
+    n_spots = adata.shape[0]
+    assert key in ["spatial", "expr"], "case should be [spatial] or [expr]"
+    if key == "spatial":
+        print("create adjacent matrix from spatial idx --------------->")
+        expr = adata.obsm[key]
+        weights = 1. / (cdist(expr, expr, "euclidean") + eps)
+    else:
+        print("create adjacent matrix from pca expr --------------->")
+        expr = PCA(n_components=n_comps, random_state=0, svd_solver=svd_solver).fit_transform(adata.X)
+        weights = correlation_graph(expr.T, expr.T)
+
+    print("create knn graph ---->")
+    threshold = np.sort(weights)[:, -n_neighbors - 1:-n_neighbors]
+    weights[weights < threshold] = 0
+    weights = (weights + weights.T) / 2
+    weights = weights * (1 - np.eye(n_spots))  # drop the diag
+
+    adjFilter = 0. if key == "spatial" else 0.1
+    # convert to bipartite case
+    adjBip = np.where(weights > adjFilter, 1, 0)
+    print(f"{key} knn graph created ----<")
+
+    return sp.coo_matrix(symm_norm(adjBip, weightDiag=self_weight))
+
+def symm_norm(adj, weightDiag=.3, eps=1e-8):
+    '''
+    args: adjacent matrix with diag = 0
+    return: D^{-1/2} (A + I) D^{-1 / 2}
+    '''
+    n_spot = adj.shape[0]
+    adj_self = (1 - weightDiag) * adj + np.eye(n_spot) * weightDiag  
+    degrees = 1. / np.sqrt((np.sum(adj_self, axis=1) + eps))
+    adj_self *= degrees
+    adj_self *= degrees[:, None]
+    return adj_self.astype(np.float32)
+
+def prepare_euclidean_graph(adata, r=550):
+    """更正：使用固定阈值 r=550 ，自环权重设为 1 """
+    spatial_coords = adata.obsm["spatial"]
+    dist = cdist(spatial_coords, spatial_coords, "euclidean")
+    
+    # 构建二元矩阵 As [cite: 224]
+    adj_binary = (dist <= r).astype(np.float32)
+    # 移除自环，后续通过 symm_norm 加入权重为 1 的 I 
+    adj_binary = adj_binary * (1 - np.eye(adata.shape[0]))
+    
+    # symm_norm 中 weightDiag 应为 1.0
+    return sp.coo_matrix(symm_norm(adj_binary, weightDiag=1.0))
+
+def prepare_cosine_graph(adata, k=14):
+    """更正：k 取 14 或 15 ，移除额外阈值，保持二元属性 """
+    # 假设此时 adata.X 已经是预处理后的表达矩阵 [cite: 215]
+    from sklearn.neighbors import NearestNeighbors
+    # STCF 使用余弦相似度度量 [cite: 228]
+    nbrs = NearestNeighbors(n_neighbors=k+1, metric='cosine').fit(adata.X)
+    adj_f = nbrs.kneighbors_graph(adata.X, mode='connectivity') # 得到二元 KNN 图
+    
+    adj_f = adj_f.toarray() * (1 - np.eye(adata.shape[0]))
+    return sp.coo_matrix(symm_norm(adj_f, weightDiag=1.0))
+
+def prepare_fused_graph(adj_spatial, adj_feature):
+    """更正：直接元素相加 Ac = As + Af ，不进行二值化"""
+    # 这里的输入应为 symm_norm 之前的原始 A 矩阵
+    adj_fused = adj_spatial + adj_feature
+    # 移除自环，统一在 symm_norm 处理自环 I [cite: 272]
+    adj_fused = adj_fused * (1 - np.eye(adj_fused.shape[0]))
+    
+    return sp.coo_matrix(symm_norm(adj_fused, weightDiag=1.0))
