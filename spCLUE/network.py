@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,37 +62,31 @@ class ZINBDecoder(nn.Module):
     def __init__(self, z_dim, output_dim, hidden_dim=128):
         super().__init__()
         
-        # MAFN 风格：共享基础解码层
+        # 共享特征提取层
         self.decoder_base = nn.Sequential(
             nn.Linear(z_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU()
         )
         
-        # 分叉输出三个参数
+        # 分叉输出三个参数：pi (零膨胀), disp (离散度), mean (均值)
         self.pi_layer = nn.Linear(hidden_dim, output_dim)
         self.disp_layer = nn.Linear(hidden_dim, output_dim)
         self.mean_layer = nn.Linear(hidden_dim, output_dim)
         
-        # MAFN 核心激活函数与截断逻辑 (见 utils.py)
         self.DispAct = lambda x: torch.clamp(F.softplus(x), 1e-4, 1e4)
-        self.MeanAct = lambda x: torch.clamp(torch.exp(x), 1e-5, 1e6)
+        self.MeanAct = lambda x: torch.clamp(torch.exp(x), 1e-5, 1e6) 
 
-    def forward(self, z, library_size=None):
-        # 1. 基础特征提取
+    def forward(self, z):
+        """
+        不再接收 library_size 参数
+        """
         h = self.decoder_base(z)
         
-        # 2. 输出原始参数并应用激活
         pi = torch.sigmoid(self.pi_layer(h))
         disp = self.DispAct(self.disp_layer(h))
         mean = self.MeanAct(self.mean_layer(h))
         
-        # 3. 处理 library_size 归一化 (STCF 特有逻辑)
-        if library_size is not None:
-            if library_size.dim() == 1:
-                library_size = library_size.unsqueeze(1)
-            mean = mean * library_size
-            
         return mean, disp, pi
 # class CCGCN(Module):
 
@@ -217,20 +213,21 @@ class CCGCN(Module):
         self.n_clusters = n_clusters
         self.graph_corr = graph_corr  # Not used in STCF deterministic encoding
         self.use_zinb = use_zinb
+        self.dropout = dropout
 
         ### === 三个独立的确定性GCN编码器 (STCF Style) ===
         
         # 空间视图编码器 (Spatial View Encoder)
-        self.W_s1 = TransForm_W(self.input_dim, self.hidden_dim, dropout=0.0)  # 无dropout
-        self.W_s2 = TransForm_W(self.hidden_dim, self.z_dim, dropout=0.0)
+        self.W_s1 = TransForm_W(self.input_dim, self.hidden_dim)  # 无dropout
+        self.W_s2 = TransForm_W(self.hidden_dim, self.z_dim)
         
         # 特征视图编码器 (Feature View Encoder)
-        self.W_f1 = TransForm_W(self.input_dim, self.hidden_dim, dropout=0.0)
-        self.W_f2 = TransForm_W(self.hidden_dim, self.z_dim, dropout=0.0)
+        self.W_f1 = TransForm_W(self.input_dim, self.hidden_dim)  # 无dropout
+        self.W_f2 = TransForm_W(self.hidden_dim, self.z_dim)
         
         # 组合视图编码器 (Combined View Encoder)
-        self.W_c1 = TransForm_W(self.input_dim, self.hidden_dim, dropout=0.0)
-        self.W_c2 = TransForm_W(self.hidden_dim, self.z_dim, dropout=0.0)
+        self.W_c1 = TransForm_W(self.input_dim, self.hidden_dim)  # 无dropout
+        self.W_c2 = TransForm_W(self.hidden_dim, self.z_dim)
 
         # 激活函数
         self.act = nn.ELU()  # 或者 nn.ReLU()
@@ -266,15 +263,20 @@ class CCGCN(Module):
             self.zinb_decoder = None
 
     def deterministic_gcn_encoder(self, X, A_hat, W1, W2):
-        # MAFN 风格：第一层 GCN 后接 ReLU 和 Dropout
-        # 注意：MAFN 的顺序是先变换权重再聚合邻居
-        h1 = torch.spmm(A_hat, W1(X)) 
+        """
+        两层GCN（对齐MAFN）
+        """
+        # 第一层
+        support1 = W1(X)
+        h1 = torch.spmm(A_hat, support1)
         h1 = F.relu(h1)
-        if self.dropout > 0: # 如果需要确定性，CCGCN 初始化时传入 dropout=0
+        if self.dropout > 0:
             h1 = F.dropout(h1, p=self.dropout, training=self.training)
         
-        # 第二层 GCN 输出嵌入
-        z = torch.spmm(A_hat, W2(h1))
+        # 第二层
+        support2 = W2(h1)
+        z = torch.spmm(A_hat, support2)
+        
         return z
 
     def getCluster(self, embed):
@@ -340,7 +342,7 @@ class CCGCN(Module):
         ### === Step 6: 重构解码 ===
         if self.use_zinb and self.zinb_decoder is not None:
             # ZINB解码器内部会处理library_size
-            mean, disp, pi = self.zinb_decoder(z_fused, library_size)
+            mean, disp, pi = self.zinb_decoder(z_fused)
             x_rec = (mean, disp, pi)
         else:
             # 原始MSE重构 (使用空间视图的权重矩阵)
@@ -510,14 +512,16 @@ class IdentityMap(nn.Module):
 #         x = F.dropout(x, p=self.dropout, training=self.training)
 #         return x @ self.W
 class TransForm_W(nn.Module):
-    def __init__(self, input_dim, out_dim, dropout=0.0):
+    """线性变换层（对齐MAFN的GraphConvolution）"""
+    def __init__(self, input_dim, out_dim):
         super().__init__()
-        self.dropout = dropout
         self.linear = nn.Linear(input_dim, out_dim)
-        # MAFN 使用 uniform 分布初始化，也可以保留你的 xavier
-        nn.init.xavier_uniform_(self.linear.weight)
+        
+        # MAFN风格的uniform初始化
+        stdv = 1. / math.sqrt(out_dim)
+        self.linear.weight.data.uniform_(-stdv, stdv)
+        if self.linear.bias is not None:
+            self.linear.bias.data.uniform_(-stdv, stdv)
 
     def forward(self, x):
-        if self.dropout > 0:
-            x = F.dropout(x, p=self.dropout, training=self.training)
         return self.linear(x)

@@ -239,7 +239,7 @@ def preprocess(adata, hvgNumber=3000):
     
     # 5. 缩放与裁剪 (max_value=10)
     print("Scaling and clipping at threshold 10...")
-    sc.pp.scale(adata, max_value=10)
+    sc.pp.scale(adata, zero_center=False, max_value=10)
     
     return adata
 
@@ -297,17 +297,25 @@ def prepare_graph(adata, key="spatial", n_neighbors=12, n_comps=50, eps=1e-8, sv
 
     return sp.coo_matrix(symm_norm(adjBip, weightDiag=self_weight))
 
-def symm_norm(adj, weightDiag=.3, eps=1e-8):
-    '''
-    args: adjacent matrix with diag = 0
-    return: D^{-1/2} (A + I) D^{-1 / 2}
-    '''
+def symm_norm(adj, eps=1e-8):
+    # 彻底抛弃加权逻辑，使用标准的 GCN 归一化
+    import scipy.sparse as sp
+    if sp.issparse(adj):
+        adj = adj.toarray()
+    
     n_spot = adj.shape[0]
-    adj_self = (1 - weightDiag) * adj + np.eye(n_spot) * weightDiag  
-    degrees = 1. / np.sqrt((np.sum(adj_self, axis=1) + eps))
-    adj_self *= degrees
-    adj_self *= degrees[:, None]
-    return adj_self.astype(np.float32)
+    # A_hat = A + I
+    adj_with_selfloop = adj + np.eye(n_spot)
+    
+    # 计算度矩阵 D_hat
+    rowsum = np.array(adj_with_selfloop.sum(1))
+    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = np.diag(d_inv_sqrt)
+    
+    # D^{-1/2} * A_hat * D^{-1/2}
+    adj_normalized = d_mat_inv_sqrt @ adj_with_selfloop @ d_mat_inv_sqrt
+    return adj_normalized.astype(np.float32)
 
 def prepare_euclidean_graph(adata, r=550):
     """更正：使用固定阈值 r=550 ，自环权重设为 1 """
@@ -320,7 +328,7 @@ def prepare_euclidean_graph(adata, r=550):
     adj_binary = adj_binary * (1 - np.eye(adata.shape[0]))
     
     # symm_norm 中 weightDiag 应为 1.0
-    return sp.coo_matrix(symm_norm(adj_binary, weightDiag=1.0))
+    return adj_binary, sp.coo_matrix(symm_norm(adj_binary))
 
 def prepare_cosine_graph(adata, k=14):
     """更正：k 取 14 或 15 ，移除额外阈值，保持二元属性 """
@@ -331,7 +339,8 @@ def prepare_cosine_graph(adata, k=14):
     adj_f = nbrs.kneighbors_graph(adata.X, mode='connectivity') # 得到二元 KNN 图
     
     adj_f = adj_f.toarray() * (1 - np.eye(adata.shape[0]))
-    return sp.coo_matrix(symm_norm(adj_f, weightDiag=1.0))
+    adj_f = np.maximum(adj_f, adj_f.T) # 强制对称，保证 D^{-1/2} A D^{-1/2} 的数学稳定性
+    return adj_f, sp.coo_matrix(symm_norm(adj_f))
 
 def prepare_fused_graph(adj_spatial, adj_feature):
     """更正：直接元素相加 Ac = As + Af ，不进行二值化"""
@@ -340,4 +349,4 @@ def prepare_fused_graph(adj_spatial, adj_feature):
     # 移除自环，统一在 symm_norm 处理自环 I [cite: 272]
     adj_fused = adj_fused * (1 - np.eye(adj_fused.shape[0]))
     
-    return sp.coo_matrix(symm_norm(adj_fused, weightDiag=1.0))
+    return sp.coo_matrix(symm_norm(adj_fused))

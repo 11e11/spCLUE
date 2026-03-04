@@ -157,33 +157,48 @@ class ZINBLoss(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-    def forward(self, x, mean, disp, pi=0, scale_factor=1.0, ridge_lambda=0.0):
-        '''
-        args: x, raw count, [N, hvgs]
-              scale_factor, [n,]
-        '''
+    def _nan2inf(self, x):
+        """处理计算中可能出现的 NaN，将其转为较大的常数"""
+        return torch.where(torch.isnan(x), torch.full_like(x, 1e6), x)
+
+    def forward(self, x, mean, disp, pi, ridge_lambda=0.0):
+        """
+        x:    对应 adata.X (Normalized & Scaled)
+        mean: 解码器输出的均值
+        disp: 解码器输出的离散度
+        pi:   解码器输出的零概率
+        """
         eps = 1e-10
-        disp = torch.clamp(disp, max=1e6)
-        # mean = (mean.T * scale_factor).T
-        # if pi == 0:
-        #     pi = torch.tensor(0.0)
-
-        t1 = torch.lgamma(disp + eps) + torch.lgamma(x + 1.0) - torch.lgamma(
-            x + disp + eps)
+        
+        # 1. NB 对数似然计算 (处理 y_true + 1.0 用于 Gamma 函数)
+        # 虽然 x 是连续值，但 torch.lgamma 支持实数输入
+        t1 = torch.lgamma(disp + eps) + torch.lgamma(x + 1.0) - torch.lgamma(x + disp + eps)
+        
+        # 稳定性优化：利用 log(1 + x/y) 避免直接除法
         t2 = (disp + x) * torch.log(1.0 + (mean / (disp + eps))) + (
-            x * (torch.log(disp + eps) - torch.log(mean + eps)))
+              x * (torch.log(disp + eps) - torch.log(mean + eps)))
+        
         nb_final = t1 + t2
-
+        
+        # 2. 考虑零膨胀的情况
+        # NB case: 概率为 (1-pi) * P_nb(x)
         nb_case = nb_final - torch.log(1.0 - pi + eps)
+        
+        # Zero case: 概率为 pi + (1-pi) * P_nb(0)
         zero_nb = torch.pow(disp / (disp + mean + eps), disp)
         zero_case = -torch.log(pi + ((1.0 - pi) * zero_nb) + eps)
+        
+        # 根据 x 是否接近 0 选择损失
         result = torch.where(torch.le(x, 1e-8), zero_case, nb_case)
 
+        # 3. 正则项
         if ridge_lambda > 0:
-            ridge = ridge_lambda * torch.square(pi)
-            result += ridge
+            result += ridge_lambda * torch.square(pi)
 
+        # 4. 最终均值化与 NaN 保护
         result = torch.mean(result)
+        result = self._nan2inf(result)
+        
         return result
 # class ZINBLoss(nn.Module):
 #     def forward(self, x, mean, disp, pi, ridge_lambda=0.0):

@@ -16,7 +16,7 @@ class spCLUE:
     graph_dict,
     n_clusters=12,
     batch_list=None,
-    epochs=500,
+    epochs=250,
     random_seed=0,
     device=torch.device("cuda:0"),
     learning_rate=0.001,
@@ -25,7 +25,7 @@ class spCLUE:
     dim_hidden=128,
     dim_embed=64,
     graph_corr=0.4,
-    dropout=0.5,
+    dropout=0.0,
     gamma=1,
     beta=1,
     kappa=0.1,
@@ -161,8 +161,8 @@ class spCLUE:
             # 重构损失
             if self.use_zinb:
                 mean, disp, pi = x_rec
-                scale_factor = self.library_size.squeeze() if self.library_size is not None else 1.0
-                cur_rec_expr_loss = self.rec_crit(self.raw_count, mean, disp, pi, scale_factor)
+                
+                cur_rec_expr_loss = self.rec_crit(self.input_data, mean, disp, pi, ridge_lambda=0)
             else:
                 cur_rec_expr_loss = self.rec_crit(x_rec, self.input_data)
 
@@ -177,11 +177,12 @@ class spCLUE:
             cur_batch_loss.backward()
             self.optimizer.step()
             
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 100 == 0:
                 predLabel1_np = label_spatial.detach().cpu().numpy().argmax(axis=1)
                 predLabel2_np = label_feature.detach().cpu().numpy().argmax(axis=1)
                 cur_ari = adjusted_rand_score(predLabel1_np, predLabel2_np)
                 print(f"epoch {epoch + 1}: ARI={cur_ari:.4f}, CCR={cur_ccr_loss.item():.4f}, CLU={cur_cluster_loss.item():.4f}, REC={cur_rec_expr_loss.item():.4f}")
+                print(x_rec[0])
             if (epoch + 1) % 250 == 0:
                 if cur_ari >= max_ari:
                     predLabel, features_fuse = self.updateResult()
@@ -197,7 +198,7 @@ class spCLUE:
             features_fuse = z_fused.detach().cpu().numpy()
             predLabel = predLabel.detach().cpu().numpy()
 
-        return predLabel, features_fuse
+        return predLabel, features_fuse, attention_weights.detach().cpu().numpy()
 
 
     def trainBatch(self):
