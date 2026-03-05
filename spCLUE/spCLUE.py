@@ -32,6 +32,8 @@ class spCLUE:
     lambda_ccr=0.5,  # 新增：CCR损失权重
     use_zinb=False,  # 新增：是否使用ZINB解码器
     batch_train=False,
+    lambda_reg=0.1,  # 正则化损失权重
+    reg_mode='spatial',  # 'spatial', 'combined', 'both' - 使用哪个图
     ):
         self.device = device
         self.learning_rate = learning_rate
@@ -49,6 +51,8 @@ class spCLUE:
         self.use_zinb = use_zinb  # 新增
         self.dims_list = [dim_input, dim_hidden, dim_embed]
         self.n_spot = input_data.shape[0]
+        self.lambda_reg = lambda_reg  # 新增
+        self.reg_mode = reg_mode  # 新增
 
         fix_seed(self.random_seed)
         self.input_data = torch.FloatTensor(input_data).to(self.device)
@@ -57,6 +61,7 @@ class spCLUE:
         self.g_spatial = sparse_mx_to_torch_sparse_tensor(graph_dict["spatial"]).to(self.device)
         self.g_feature = sparse_mx_to_torch_sparse_tensor(graph_dict["feature"]).to(self.device)
         self.g_combined = sparse_mx_to_torch_sparse_tensor(graph_dict["combined"]).to(self.device)
+        self.adj_s = torch.FloatTensor(graph_dict["adj_s"]).to(self.device)
         
         # 保存raw count用于ZINB
         if use_zinb and "raw_count" in graph_dict:
@@ -108,11 +113,13 @@ class spCLUE:
             return predLabel, features_fuse
 
     def train(self):
-        from .loss import CCRLoss, ZINBLoss  # 新增导入
+        from .loss import CCRLoss, ZINBLoss, RegularizationLoss  # 新增导入
         
         self.instance_crit = ContrastiveLoss()
         self.cluster_crit = ClusterLoss(self.n_clusters, self.device)
-        self.ccr_crit = CCRLoss()  # 新增
+        self.ccr_crit = CCRLoss()  
+        # 🔥 新增: 初始化正则化损失
+        self.reg_crit = RegularizationLoss()
         
         if self.use_zinb:
             self.rec_crit = ZINBLoss()
@@ -166,12 +173,28 @@ class spCLUE:
             else:
                 cur_rec_expr_loss = self.rec_crit(x_rec, self.input_data)
 
+            # 🔥 新增: 正则化损失
+            if self.reg_mode == 'spatial':
+                # 仅使用空间图
+                cur_reg_loss = self.reg_crit(z_fused, self.adj_s, mode='spatial')
+            elif self.reg_mode == 'combined':
+                # 仅使用联合图
+                cur_reg_loss = self.reg_crit(z_fused, self.g_combined, mode='combined')
+            elif self.reg_mode == 'both':
+                # 同时使用两个图,取平均
+                reg_loss_spatial = self.reg_crit(z_fused, self.g_spatial, mode='spatial')
+                reg_loss_combined = self.reg_crit(z_fused, self.g_combined, mode='combined')
+                cur_reg_loss = (reg_loss_spatial + reg_loss_combined) / 2
+            else:
+                cur_reg_loss = torch.tensor(0.0, device=self.device)
+
             # 总损失
             cur_batch_loss = (
                 # self.kappa * cur_contrastive_loss
                 + self.beta * cur_cluster_loss
                 + self.lambda_ccr * cur_ccr_loss  # 新增
                 + self.gamma * cur_rec_expr_loss
+                + self.lambda_reg * cur_reg_loss  
             )
             
             cur_batch_loss.backward()
@@ -181,8 +204,8 @@ class spCLUE:
                 predLabel1_np = label_spatial.detach().cpu().numpy().argmax(axis=1)
                 predLabel2_np = label_feature.detach().cpu().numpy().argmax(axis=1)
                 cur_ari = adjusted_rand_score(predLabel1_np, predLabel2_np)
-                print(f"epoch {epoch + 1}: ARI={cur_ari:.4f}, CCR={cur_ccr_loss.item():.4f}, CLU={cur_cluster_loss.item():.4f}, REC={cur_rec_expr_loss.item():.4f}")
-                print(x_rec[0])
+                print(f"epoch {epoch + 1}: ARI={cur_ari:.4f}, CCR={cur_ccr_loss.item():.4f}, CLU={cur_cluster_loss.item():.4f}, REC={cur_rec_expr_loss.item():.4f}, REG={cur_reg_loss.item():.4f}")
+                # print(x_rec[0])
             # if (epoch + 1) % 100 == 0:
             #     if cur_ari >= max_ari:
             #         predLabel, features_fuse = self.updateResult()

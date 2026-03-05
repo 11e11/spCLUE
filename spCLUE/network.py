@@ -240,62 +240,88 @@ class ZINBDecoder(nn.Module):
 #         # # 最后一层解码
 #         # x_Rec = self.relu(rec_hidden) @ self.Transform1.W.t()
 #         return h1_norm, h2_norm, z1_norm, z2_norm, z, att_beta, label1, label2, x_Rec
-class CCGCN(Module):
+import math
+import torch
+from torch.nn.parameter import Parameter
+from torch.nn.modules.module import Module
 
+
+class GraphConvolution(Module):
+    """
+    Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
+    """
+
+    def __init__(self, in_features, out_features, bias=True):
+        super(GraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
+        if bias:
+            self.bias = Parameter(torch.FloatTensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, adj):
+        support = torch.mm(input, self.weight)
+        output = torch.spmm(adj, support)
+        if self.bias is not None:
+            return output + self.bias
+        else:
+            return output
+
+    def __repr__(self):
+        return self.__class__.__name__ + ' (' \
+               + str(self.in_features) + ' -> ' \
+               + str(self.out_features) + ')'
+class GCN(nn.Module):
+    def __init__(self, nfeat, nhid, out, dropout):
+        super(GCN, self).__init__()
+        self.gc1 = GraphConvolution(nfeat, nhid)
+        self.gc2 = GraphConvolution(nhid, out)
+        self.dropout = dropout
+
+    def forward(self, x, adj):
+        x = F.relu(self.gc1(x, adj))
+        x = F.dropout(x, self.dropout, training=self.training)
+        x = self.gc2(x, adj)
+        return x
+class CCGCN(Module):
     def __init__(self, dims_list, n_clusters, graph_corr=0.4, dropout=0.5, use_zinb=False) -> None:
         super(CCGCN, self).__init__()
-        """
-        Enhanced CCGCN with STCF-style three-view architecture
-        
-        Args: 
-            dims_list (list): dimensions of GCNs [input_dim, hidden_dim, z_dim].
-            n_clusters (int): number of clusters in the cluster-contrastive module.
-            graph_corr (float): corruption probability (DEPRECATED in STCF, kept for compatibility).
-            dropout (float): dropout rate for projection heads (not used in encoders).
-            use_zinb (bool): whether to use ZINB decoder.
-        """
         self.input_dim = dims_list[0]
         self.hidden_dim = dims_list[1]
         self.z_dim = dims_list[2]
         self.dropout = dropout
         self.n_clusters = n_clusters
-        self.graph_corr = graph_corr  # Not used in STCF deterministic encoding
         self.use_zinb = use_zinb
-        self.dropout = dropout
 
-        ### === 三个独立的确定性GCN编码器 (STCF Style) ===
-        
-        # 空间视图编码器 (Spatial View Encoder)
-        self.W_s1 = TransForm_W(self.input_dim, self.hidden_dim)  # 无dropout
-        self.W_s2 = TransForm_W(self.hidden_dim, self.z_dim)
-        
-        # 特征视图编码器 (Feature View Encoder)
-        self.W_f1 = TransForm_W(self.input_dim, self.hidden_dim)  # 无dropout
-        self.W_f2 = TransForm_W(self.hidden_dim, self.z_dim)
-        
-        # 组合视图编码器 (Combined View Encoder)
-        self.W_c1 = TransForm_W(self.input_dim, self.hidden_dim)  # 无dropout
-        self.W_c2 = TransForm_W(self.hidden_dim, self.z_dim)
+        # MAFN 核心：可学习的 meta 参数，用于融合空间图和特征图 (utils.py)
+        # 初始化为 0.5，表示平分权重
+        self.meta = nn.Parameter(torch.Tensor([0.1]))
+        self.meta.data.clamp_(0, 1)
 
-        # 激活函数
-        self.act = nn.ELU()  # 或者 nn.ReLU()
-        self.relu = nn.ReLU()
+
+        ### === 三个独立的 GCN 编码器 (MAFN 结构) ===
+        # 空间视图
+        self.SGCN = GCN(self.input_dim, self.hidden_dim, self.z_dim, self.dropout)
         
-        # STCF风格注意力融合模块
+        # 特征视图
+        self.FGCN = GCN(self.input_dim, self.hidden_dim, self.z_dim, self.dropout)
+        
+        # 组合视图 (CGCN)
+        self.CGCN = GCN(self.input_dim, self.hidden_dim, self.z_dim, self.dropout)
+
+        # STCF 风格注意力融合 (保留你的 CAM 设计)
         self.attention = STCFAttentionBlock(self.z_dim)
 
-        ### === Projection Heads (保留原spCLUE设计用于对比学习) ===
-        
-        ## Instance-level projection head (用于ContrastiveLoss)
-        self.projectInsHead = nn.Sequential(
-            nn.Linear(self.z_dim, self.z_dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),  # 这里使用dropout
-            nn.Linear(self.z_dim, self.z_dim),
-            nn.ReLU(),
-        )
-
-        ## Cluster-level projection head (用于ClusterLoss)
+        # Projection Heads 和 Decoder 部分保持不变...
         self.projectClsHead = nn.Sequential(
             nn.Linear(self.z_dim, self.z_dim),
             nn.ReLU(),
@@ -304,27 +330,23 @@ class CCGCN(Module):
             nn.Softmax(dim=1),
         )
         
-        ### === 可选的ZINB解码器 ===
         if self.use_zinb:
             self.zinb_decoder = ZINBDecoder(self.z_dim, self.input_dim)
-        else:
-            self.zinb_decoder = None
 
-    def deterministic_gcn_encoder(self, X, A_hat, W1, W2):
+    def mafn_gcn_encoder(self, X, A_hat, layers):
         """
-        两层GCN（对齐MAFN）
+        完全对齐 MAFN 的 GCN 执行逻辑：
+        1. 线性变换 W
+        2. 邻域聚合 SPMM
+        3. 激活与 Dropout (第一层后)
         """
-        # 第一层
-        support1 = W1(X)
-        h1 = torch.spmm(A_hat, support1)
-        h1 = F.relu(h1)
-        if self.dropout > 0:
-            h1 = F.dropout(h1, p=self.dropout, training=self.training)
+        # 第一层: x = ReLU(SPMM(A, XW))
+        x = torch.spmm(A_hat, layers[0](X))
+        x = F.relu(x)
+        x = F.dropout(x, self.dropout, training=self.training)
         
-        # 第二层
-        support2 = W2(h1)
-        z = torch.spmm(A_hat, support2)
-        
+        # 第二层: z = SPMM(A, xW)
+        z = torch.spmm(A_hat, layers[1](x))
         return z
 
     def getCluster(self, embed):
@@ -332,83 +354,37 @@ class CCGCN(Module):
         labels = self.projectClsHead(embed)
         return torch.argmax(labels, dim=1)
 
-    def forward(self, data, adj_spatial, adj_feature, adj_combined, 
-                batch_onehot=None, library_size=None):
-        """
-        Forward pass with three-view encoding and STCF-style fusion
+    def forward(self, data, adj_spatial, adj_feature, adj_combined, library_size=None):
+        ### === Step 1: MAFN 风格动态邻接矩阵融合 ===
+        # 这里的 adj_combined 在 MAFN 中是由 meta 动态计算的
+        # 为了完全一致，我们可以直接用 meta 重新混���传入的图
+        # 在输入前或 forward 内部转换
+        adj_spatial_dense = adj_spatial.to_dense()
+        adj_feature_dense = adj_feature.to_dense()
+
+        actual_combined_adj = self.meta * adj_feature_dense + (1 - self.meta) * adj_spatial_dense
+
+        ### === Step 2: 三视图编码 ===
+        z_s = self.SGCN(data, adj_spatial)
+        z_f = self.FGCN(data, adj_feature)
+        z_c = self.CGCN(data, actual_combined_adj)
+
+        ### === Step 3: 注意力融合 (STCF-style) ===
+        # 注意：MAFN 在融合前通常不进行强制 L2 归一化，
+        # 而是靠注意力模块内部的 F.normalize 或 Softmax 
+        z_fused, attention_weights = self.attention(z_s, z_f, z_c)
+
+        # 后面计算投影头和 ZINB 解码的逻辑保持一致...
+        label_spatial = self.projectClsHead(z_s)
+        label_feature = self.projectClsHead(z_f)
         
-        Args:
-            data: 输入特征矩阵 [N, input_dim]
-            adj_spatial: 归一化空间图邻接矩阵 (sparse tensor)
-            adj_feature: 归一化特征图邻接矩阵 (sparse tensor)
-            adj_combined: 归一化组合图邻接矩阵 (sparse tensor)
-            library_size: ZINB解码所需的文库大小 [N, 1]
-            
-        Returns:
-            Tuple containing:
-                h_spatial, h_feature: instance-level projections for ContrastiveLoss
-                z_spatial, z_feature: raw embeddings for CCR Loss
-                z_combined: combined view embedding
-                z_fused: attention-fused embedding
-                label_spatial, label_feature: cluster assignments for ClusterLoss
-                x_rec: reconstruction output (MSE or ZINB)
-                attention_weights: CAM attention weights
-        """
-        ### === Step 1: 三个视图的独立确定性编码 ===
-        
-        # 空间视图编码: E_s = GCN_spatial(X, A_s)
-        E_spatial = self.deterministic_gcn_encoder(
-            data, adj_spatial, self.W_s1, self.W_s2
-        )
-        
-        # 特征视图编码: E_f = GCN_feature(X, A_f)
-        E_feature = self.deterministic_gcn_encoder(
-            data, adj_feature, self.W_f1, self.W_f2
-        )
-        
-        # 组合视图编码: E_c = GCN_combined(X, A_c)
-        E_combined = self.deterministic_gcn_encoder(
-            data, adj_combined, self.W_c1, self.W_c2
-        )
-
-        ### === Step 2: L2归一化 (用于后续相似度计算) ===
-        z_spatial = normalize(E_spatial, p=2, dim=1)
-        z_feature = normalize(E_feature, p=2, dim=1)
-        z_combined = normalize(E_combined, p=2, dim=1)
-
-        ### === Step 3: Instance-level Projection (用于ContrastiveLoss) ===
-        h_spatial = normalize(self.projectInsHead(z_spatial), p=2, dim=1)
-        h_feature = normalize(self.projectInsHead(z_feature), p=2, dim=1)
-
-        ### === Step 4: Cluster-level Projection (用于ClusterLoss) ===
-        label_spatial = self.projectClsHead(z_spatial)
-        label_feature = self.projectClsHead(z_feature)
-
-        ### === Step 5: STCF风格跨视图注意力融合 ===
-        z_fused, attention_weights = self.attention(z_spatial, z_feature, z_combined)
-
-        ### === Step 6: 重构解码 ===
-        if self.use_zinb and self.zinb_decoder is not None:
-            # ZINB解码器内部会处理library_size
+        if self.use_zinb:
             mean, disp, pi = self.zinb_decoder(z_fused)
             x_rec = (mean, disp, pi)
         else:
-            # 原始MSE重构 (使用空间视图的权重矩阵)
-            x_rec = self.relu(z_fused @ self.W_s2.W.data.T) @ self.W_s1.W.data.T
+            x_rec = None # 原 MSE 逻辑
 
-        ### === 返回所有需要的中间结果 ===
-        return (
-            h_spatial,          # [N, z_dim] - for ContrastiveLoss
-            h_feature,          # [N, z_dim] - for ContrastiveLoss
-            z_spatial,          # [N, z_dim] - for CCR Loss (raw spatial embedding)
-            z_feature,          # [N, z_dim] - for CCR Loss (raw feature embedding)
-            z_combined,         # [N, z_dim] - combined view embedding
-            z_fused,            # [N, z_dim] - final fused embedding
-            label_spatial,      # [N, n_clusters] - for ClusterLoss
-            label_feature,      # [N, n_clusters] - for ClusterLoss
-            x_rec,              # reconstruction (MSE or ZINB tuple)
-            attention_weights   # [N, 3] - CAM attention weights
-        )
+        return (None, None, z_s, z_f, z_c, z_fused, label_spatial, label_feature, x_rec, attention_weights)
 
 class CCGCNs(Module):
 

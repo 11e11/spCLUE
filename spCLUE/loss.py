@@ -50,6 +50,59 @@ class CCRLoss(nn.Module):
         
         # 总损失 [cite: 263]
         return loss_diag + loss_off_diag
+# class CCRLoss(nn.Module):
+#     """
+#     DICR Loss (Dual Information Correlation Reduction)
+#     特征级去相关损失 - 对齐MAFN实现
+#     """
+#     def __init__(self) -> None:
+#         super().__init__()
+    
+#     def forward(self, x, xbar):
+#         """
+#         x: 视图1的嵌入 (N, d), 例如空间图嵌入 E_s
+#         xbar: 视图2的嵌入 (N, d), 例如特征图嵌入 E_f
+        
+#         Returns:
+#             特征级去相关损失
+#         """
+#         # 🔥 关键修改：转置到特征空间
+#         # x: [N, d] -> x.t(): [d, N]
+#         S = self._cross_correlation(x.t(), xbar.t())  # [d, d]
+        
+#         # 对角线损失：同一特征维度在不同视图应对齐 (S[i,i]→1)
+#         diag_loss = torch.diagonal(S).add(-1).pow(2).mean()
+        
+#         # 非对角线损失：不同特征维度应不相关 (S[i,j]→0)
+#         off_diag_loss = self._off_diagonal(S).pow(2).mean()
+        
+#         return diag_loss + off_diag_loss
+    
+#     def _cross_correlation(self, Z_v1, Z_v2):
+#         """
+#         计算跨视图特征相关矩阵
+#         Args:
+#             Z_v1: [d, N] - 视图1的特征 (转置后)
+#             Z_v2: [d, N] - 视图2的特征 (转置后)
+#         Returns:
+#             S: [d, d] - 特征相关矩阵
+#         """
+#         # L2归一化后计算内积
+#         Z_v1_norm = F.normalize(Z_v1, p=2, dim=1)  # [d, N]
+#         Z_v2_norm = F.normalize(Z_v2, p=2, dim=1)  # [d, N]
+#         return torch.mm(Z_v1_norm, Z_v2_norm.t())  # [d, d]
+    
+#     def _off_diagonal(self, x):
+#         """
+#         提取矩阵的非对角线元素
+#         Args:
+#             x: [d, d] 方阵
+#         Returns:
+#             非对角线元素的扁��化向量
+#         """
+#         n, m = x.shape
+#         assert n == m, "Matrix must be square"
+#         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 class ClusterLoss(nn.Module):
     def __init__(
@@ -238,3 +291,60 @@ class ZINBLoss(nn.Module):
 #         result = torch.where(torch.isinf(result), torch.full_like(result, 1e10), result) # 进一步防止 inf
 
 #         return torch.mean(result)
+class RegularizationLoss(nn.Module):
+    """
+    局部正则化损失 (参考MAFN实现)
+    基于图的邻居关系约束嵌入空间
+    """
+    def __init__(self, eps=1e-15):
+        super(RegularizationLoss, self).__init__()
+        self.eps = eps
+    
+    def cosine_similarity(self, emb):
+        """计算嵌入的余弦相似度矩阵"""
+        mat = torch.matmul(emb, emb.T)
+        norm = torch.norm(emb, p=2, dim=1).reshape((emb.shape[0], 1))
+        mat = torch.div(mat, torch.matmul(norm, norm.T) + self.eps)
+        
+        # 处理 NaN
+        if torch.any(torch.isnan(mat)):
+            mat = torch.where(torch.isnan(mat), torch.zeros_like(mat), mat)
+        
+        # 去除对角线
+        mat = mat - torch.diag_embed(torch.diag(mat))
+        return mat
+    
+    def forward(self, emb, graph_adj, mode='spatial'):
+        """
+        Args:
+            emb: 嵌入表示 [n_spots × embed_dim]
+            graph_adj: 图的邻接矩阵 (稀疏张量)
+            mode: 'spatial' 或 'combined' - 使用哪个图
+        
+        Returns:
+            loss: 正则化损失标量
+        """
+        # 将稀疏邻接矩阵转为稠密的邻居/非邻居矩阵
+        if graph_adj.is_sparse:
+            graph_nei = graph_adj.to_dense()
+        else:
+            graph_nei = graph_adj
+        
+        # 构造非邻居矩阵 (graph_neg)
+        graph_neg = torch.ones_like(graph_nei) - graph_nei
+        # 去除对角线 (自己不算邻居也不算非邻居)
+        graph_neg = graph_neg - torch.diag_embed(torch.diag(graph_neg))
+        
+        # 计算余弦相似度矩阵
+        mat = torch.sigmoid(self.cosine_similarity(emb))
+        
+        # 邻居损失: 邻居的嵌入应该相似 (mat 应该接近 1)
+        neigh_loss = torch.sum(graph_nei * torch.log(mat + self.eps)) / graph_nei.sum()
+        
+        # 非邻居损失: 非邻居的嵌入应该不同 (mat 应该接近 0)
+        neg_loss = torch.sum(graph_neg * torch.log(1 - mat + self.eps)) / graph_neg.sum()
+        
+        # 总损失 (取负号,因为我们希望最大化 log likelihood)
+        pair_loss = -(neigh_loss + neg_loss) / 2
+        
+        return pair_loss

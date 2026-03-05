@@ -215,31 +215,51 @@ import scipy.sparse as sp
 #     sc.pp.scale(adata)
 #     return adata
 def preprocess(adata, hvgNumber=3000):
+    import numpy as np
+    from scipy.sparse import issparse
+
     print("Preprocessing starting according to CSMVL description...")
     
-    # 1. 基因过滤：至少在 100 个 spot 中表达
+    # 1. 基因过滤
     sc.pp.filter_genes(adata, min_cells=100) 
-    sc.pp.filter_cells(adata, min_counts=1)
 
-    if sp.issparse(adata.X):
-        adata.layers['count'] = adata.X.copy() # 保持稀疏以节省内存
-    else:
-        adata.layers['count'] = adata.X.copy()
+    # 保存原始 count (MAFN/CSMVL 风格)
+    adata.layers['count'] = adata.X.copy()
     
-    # 2. 高变基因选择 (使用 seurat_v3 针对 raw count)
+    # 2. 高变基因选择
     print(f"Selecting top {hvgNumber} HVGs...")
-    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=hvgNumber, subset=True)
+    # 注意：seurat_v3 必须作用于原始 count，确保此时未进行归一化
+    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=hvgNumber)
     
-    # 3. 归一化：target_sum = 10,000
+    # 这一步 copy() 很关键，它能切断视图关联并重置数据格式
+    adata = adata[:, adata.var.highly_variable].copy()
+    
+    # 3. 归一化 (替代你的手动除法)
     print("Normalizing total counts to 10,000...")
     sc.pp.normalize_total(adata, target_sum=1e4)
     
-    # 4. 对数变换
-    sc.pp.log1p(adata)
+    # 【核心防御】在进行数学运算前，彻底消除 np.matrix
+    if not issparse(adata.X):
+        # 强制转换为标准的 numpy ndarray
+        adata.X = np.asarray(adata.X)
     
-    # 5. 缩放与裁剪 (max_value=10)
+    # 4. 对数变换 (可选，MAFN 默认通常不做，但 CSMVL/STCF 推荐做)
+    # 如果不做对数变换，数据会有极大的离群值，影响 scale 效果
+    # sc.pp.log1p(adata)
+    
+    # 5. 缩放与裁剪
     print("Scaling and clipping at threshold 10...")
+    # 如果 adata.X 是稀疏矩阵且 zero_center=True，会强制转为稠密
+    # 建议此处手动转稠密，确保安全
+    if issparse(adata.X):
+        adata.X = adata.X.toarray()
+    
+    # 执行 scale
     sc.pp.scale(adata, zero_center=False, max_value=10)
+    
+    # 【最终确认】再次清理可能的类型污染
+    if not issparse(adata.X):
+        adata.X = np.asarray(adata.X)
     
     return adata
 
