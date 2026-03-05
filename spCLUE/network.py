@@ -37,27 +37,75 @@ class AttentionBlock(nn.Module):
         return (beta * z).sum(1), beta
 
 # STCF CAM 核心逻辑
+# class STCFAttentionBlock(nn.Module):
+#     def __init__(self, in_size):
+#         super().__init__()
+#         # W 直接投影到 3 个视图的权重空间 (公式 15)
+#         self.W = nn.Linear(in_size * 3, 3) 
+#         self.F_l = nn.Linear(in_size * 3, in_size) # 最终融合层 (公式 16)
+
+#     def forward(self, z_spatial, z_feature, z_combined):
+#         E_prime = torch.cat([z_spatial, z_feature, z_combined], dim=1) # [N, 3*d]
+        
+#         # 计算共享注意力信号 U 并进行 L2 归一化 (公式 15)
+#         # 这里的 U 实际上就包含了 scalar attention weights (u1, u2, u3)
+#         # 修改为 Softmax
+#         # weights = F.softmax(self.W(E_prime), dim=1) 
+#         weights = F.normalize(self.W(E_prime), p=2, dim=1) # [N, 3]
+        
+#         # 这里的权重通常需要通过 sigmoid 或 abs 确保为正，或直接使用原值
+#         # 论文提到使用这些权重 re-calibrate 嵌入矩阵 (公式 16)
+#         u1, u2, u3 = weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
+        
+#         weighted_concat = torch.cat([u1 * z_spatial, u2 * z_feature, u3 * z_combined], dim=1)
+#         return self.F_l(weighted_concat), weights
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class STCFAttentionBlock(nn.Module):
     def __init__(self, in_size):
         super().__init__()
-        # W 直接投影到 3 个视图的权重空间 (公式 15)
-        self.W = nn.Linear(in_size * 3, 3) 
-        self.F_l = nn.Linear(in_size * 3, in_size) # 最终融合层 (公式 16)
+        # 【修改点 1】W 不再是投影到 3 个标量，而是对每个视图的特征独立进行线性映射
+        # 对应 MAFN 源码中的 MLP_L (Linear(64, 64))
+        self.wl = nn.Linear(in_size, in_size) 
+        
+        # 最终融合层，对应 MAFN 源码中的 self.MLP (Linear(192, 64))
+        self.F_l = nn.Linear(in_size * 3, in_size) 
 
     def forward(self, z_spatial, z_feature, z_combined):
-        E_prime = torch.cat([z_spatial, z_feature, z_combined], dim=1) # [N, 3*d]
+        # 【修改点 2】不再使用拼接 (cat)，而是使用堆叠 (stack)
+        # 对应源码：emb = torch.stack([emb1, com, emb2], dim=1)
+        # 形状变为 [N, 3, in_size]
+        stacked_emb = torch.stack([z_spatial, z_combined, z_feature], dim=1) 
         
-        # 计算共享注意力信号 U 并进行 L2 归一化 (公式 15)
-        # 这里的 U 实际上就包含了 scalar attention weights (u1, u2, u3)
-        # 修改为 Softmax
-        weights = F.softmax(self.W(E_prime), dim=1) 
+        # 【修改点 3】计算特征级注意力权重
+        # self.wl 作用于 [N, 3, in_size] 上，相当于对 3 个视图独立做 in_size -> in_size 的映射
+        # 对应源码：a = self.MLP_L(emb)
+        raw_weights = self.wl(stacked_emb) # 形状 [N, 3, in_size]
         
-        # 这里的权重通常需要通过 sigmoid 或 abs 确保为正，或直接使用原值
-        # 论文提到使用这些权重 re-calibrate 嵌入矩阵 (公式 16)
-        u1, u2, u3 = weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
+        # 【修改点 4】在视图维度 (dim=1) 上进行 L2 归一化
+        # 这意味着对于每一个特征维度（共 in_size 个），都会在 3 个视图间分配 L2 归一化的权重
+        # 对应源码：emb = F.normalize(a, p=2)
+        weights = F.normalize(raw_weights, p=2, dim=1) # 形状 [N, 3, in_size]
         
-        weighted_concat = torch.cat([u1 * z_spatial, u2 * z_feature, u3 * z_combined], dim=1)
-        return self.F_l(weighted_concat), weights
+        # 【修改点 5】提取特征级权重并进行逐元素相乘 (element-wise multiplication)
+        # 此时的权重 weights[:, 0] 形状是 [N, in_size]，它不再是标量，而是一个特征向量
+        u1 = weights[:, 0, :] # 空间图的特征级权重
+        u2 = weights[:, 1, :] # 联合图的特征级权重
+        u3 = weights[:, 2, :] # 特征图的特征级权重
+        
+        # 对应源码：emb = torch.cat((emb[:, 0].mul(emb1), emb[:, 1].mul(com), emb[:, 2].mul(emb2)), 1)
+        weighted_concat = torch.cat([
+            u1 * z_spatial,   # 特征级逐元素相乘
+            u2 * z_combined,  # 注意 MAFN 源码中间放的是联合图 (com)
+            u3 * z_feature
+        ], dim=1) # 拼接后形状 [N, 3 * in_size]
+        
+        # 对应源码：emb = self.MLP(emb)
+        out = self.F_l(weighted_concat)
+        
+        return out, weights
 class ZINBDecoder(nn.Module):
     def __init__(self, z_dim, output_dim, hidden_dim=128):
         super().__init__()

@@ -177,16 +177,16 @@ class spCLUE:
             cur_batch_loss.backward()
             self.optimizer.step()
             
-            if (epoch + 1) % 100 == 0:
+            if (epoch + 1) % 50 == 0:
                 predLabel1_np = label_spatial.detach().cpu().numpy().argmax(axis=1)
                 predLabel2_np = label_feature.detach().cpu().numpy().argmax(axis=1)
                 cur_ari = adjusted_rand_score(predLabel1_np, predLabel2_np)
                 print(f"epoch {epoch + 1}: ARI={cur_ari:.4f}, CCR={cur_ccr_loss.item():.4f}, CLU={cur_cluster_loss.item():.4f}, REC={cur_rec_expr_loss.item():.4f}")
                 print(x_rec[0])
-            if (epoch + 1) % 250 == 0:
-                if cur_ari >= max_ari:
-                    predLabel, features_fuse = self.updateResult()
-                    return predLabel, features_fuse, attention_weights.detach().cpu().numpy()
+            # if (epoch + 1) % 100 == 0:
+            #     if cur_ari >= max_ari:
+            #         predLabel, features_fuse = self.updateResult()
+            #         return predLabel, features_fuse, attention_weights.detach().cpu().numpy()
 
         print("Training Finished =================<")
         with torch.no_grad():
